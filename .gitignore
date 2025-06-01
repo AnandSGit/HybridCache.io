@@ -1,0 +1,224 @@
+# Database Agnostic Storage Library - Multi-Language .gitignore
+
+# =============================================================================
+# Go specific ignores
+# =============================================================================
+
+# Binaries for programs and plugins
+*.exe
+*.exe~
+*.dll
+*.so
+*.dylib
+
+# Test binary, built with `go test -c`
+*.test
+
+# Output of the go coverage tool, specifically when used with LiteIDE
+*.out
+
+# Dependency directories (remove the comment below to include it)
+vendor/
+
+# Go workspace file
+go.work
+
+# =============================================================================
+# Python specific ignores
+# =============================================================================
+
+# Byte-compiled / optimized / DLL files
+__pycache__/
+*.py[cod]
+*$py.class
+
+# C extensions
+*.so
+
+# Distribution / packaging
+.Python
+build/
+develop-eggs/
+dist/
+downloads/
+eggs/
+.eggs/
+lib/
+lib64/
+parts/
+sdist/
+var/
+wheels/
+share/python-wheels/
+*.egg-info/
+.installed.cfg
+*.egg
+MANIFEST
+
+# PyInstaller
+*.manifest
+*.spec
+
+# Unit test / coverage reports
+htmlcov/
+.tox/
+.nox/
+.coverage
+.coverage.*
+.cache
+nosetests.xml
+coverage.xml
+*.cover
+*.py,cover
+.hypothesis/
+.pytest_cache/
+cover/
+junit.xml
+
+# Environments
+.env
+.venv
+env/
+venv/
+ENV/
+env.bak/
+venv.bak/
+
+# mypy
+.mypy_cache/
+.dmypy.json
+dmypy.json
+
+# Ruff cache
+.ruff_cache/
+
+# =============================================================================
+# IDE and Editor specific files
+# =============================================================================
+
+# VS Code
+.vscode/
+!.vscode/settings.json
+!.vscode/tasks.json
+!.vscode/launch.json
+!.vscode/extensions.json
+
+# JetBrains IDEs
+.idea/
+*.swp
+*.swo
+*~
+
+# =============================================================================
+# OS specific files
+# =============================================================================
+
+# macOS
+.DS_Store
+.DS_Store?
+._*
+.Spotlight-V100
+.Trashes
+
+# Windows
+ehthumbs.db
+Thumbs.db
+
+# =============================================================================
+# Build and deployment artifacts
+# =============================================================================
+
+# Build directories
+bin/
+build/
+dist/
+
+# Docker artifacts
+.dockerignore
+
+# =============================================================================
+# Database and log files
+# =============================================================================
+
+# Database files
+*.db
+*.sqlite
+*.sqlite3
+
+# Log files
+*.log
+logs/
+
+# =============================================================================
+# Temporary and backup files
+# =============================================================================
+
+# Temporary files
+tmp/
+temp/
+
+# Backup files
+*.bak
+*.backup
+
+# =============================================================================
+# Performance and security scan results
+# =============================================================================
+
+# Go security scans
+gosec-report.json
+govulncheck-report.json
+
+# Python security scans
+bandit-report.json
+safety-report.json
+
+# Performance profiling
+*.prof
+*.pprof
+cpu.prof
+mem.prof
+profile.svg
+
+# Benchmark results
+benchmark.txt
+benchmark.json
+.benchmarks/
+
+# =============================================================================
+# Test and coverage artifacts
+# =============================================================================
+
+# Coverage reports
+coverage.html
+coverage.out
+coverage.xml
+
+# Test containers
+.testcontainers/
+
+# =============================================================================
+# Local development files
+# =============================================================================
+
+# Local development
+local/
+.local/
+
+# Environment files
+.env.local
+.env.*.local
+
+# Editor backup files
+*~
+.#*
+\#*#
+
+# =============================================================================
+# Repository specific ignores
+# =============================================================================
+
+# Temporary repository files
+go-repo-files/
+python-repo-files/
+storage-python/

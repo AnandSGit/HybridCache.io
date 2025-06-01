@@ -1,0 +1,58 @@
+# Development Dockerfile for Database Agnostic Storage Library
+
+FROM golang:1.19
+
+# Install development tools
+RUN go install github.com/cosmtrek/air@latest && \
+    go install github.com/golangci/golangci-lint/cmd/golangci-lint@latest && \
+    go install golang.org/x/vuln/cmd/govulncheck@latest
+
+# Install system dependencies
+RUN apt-get update && apt-get install -y \
+    postgresql-client \
+    redis-tools \
+    sqlite3 \
+    curl \
+    vim \
+    && rm -rf /var/lib/apt/lists/*
+
+# Set working directory
+WORKDIR /app
+
+# Copy go mod files
+COPY go.mod go.sum ./
+
+# Download dependencies
+RUN go mod download
+
+# Copy source code
+COPY . .
+
+# Create air configuration for hot reload
+RUN echo 'root = "."' > .air.toml && \
+    echo 'testdata_dir = "testdata"' >> .air.toml && \
+    echo 'tmp_dir = "tmp"' >> .air.toml && \
+    echo '' >> .air.toml && \
+    echo '[build]' >> .air.toml && \
+    echo '  args_bin = []' >> .air.toml && \
+    echo '  bin = "./tmp/main"' >> .air.toml && \
+    echo '  cmd = "go build -o ./tmp/main ./cmd/example"' >> .air.toml && \
+    echo '  delay = 1000' >> .air.toml && \
+    echo '  exclude_dir = ["assets", "tmp", "vendor", "testdata"]' >> .air.toml && \
+    echo '  exclude_file = []' >> .air.toml && \
+    echo '  exclude_regex = ["_test.go"]' >> .air.toml && \
+    echo '  exclude_unchanged = false' >> .air.toml && \
+    echo '  follow_symlink = false' >> .air.toml && \
+    echo '  full_bin = ""' >> .air.toml && \
+    echo '  include_dir = []' >> .air.toml && \
+    echo '  include_ext = ["go", "tpl", "tmpl", "html"]' >> .air.toml && \
+    echo '  kill_delay = "0s"' >> .air.toml && \
+    echo '  log = "build-errors.log"' >> .air.toml && \
+    echo '  send_interrupt = false' >> .air.toml && \
+    echo '  stop_on_root = false' >> .air.toml
+
+# Expose port for development server
+EXPOSE 8080
+
+# Default command for development
+CMD ["air", "-c", ".air.toml"]

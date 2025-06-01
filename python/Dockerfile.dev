@@ -1,0 +1,48 @@
+# Development Dockerfile for Database Agnostic Storage Library (Python)
+
+FROM python:3.11-slim
+
+# Set environment variables
+ENV PYTHONUNBUFFERED=1
+ENV PYTHONDONTWRITEBYTECODE=1
+ENV PYTHONPATH=/app/src
+
+# Install system dependencies
+RUN apt-get update && apt-get install -y \
+    build-essential \
+    curl \
+    git \
+    postgresql-client \
+    redis-tools \
+    && rm -rf /var/lib/apt/lists/*
+
+# Install Poetry
+RUN pip install poetry
+
+# Configure Poetry
+ENV POETRY_NO_INTERACTION=1
+ENV POETRY_VENV_IN_PROJECT=1
+ENV POETRY_CACHE_DIR=/tmp/poetry_cache
+
+# Set work directory
+WORKDIR /app
+
+# Copy Poetry files
+COPY pyproject.toml poetry.lock* ./
+
+# Install dependencies
+RUN poetry install --no-dev && rm -rf $POETRY_CACHE_DIR
+
+# Copy source code
+COPY . .
+
+# Install development dependencies
+RUN poetry install && rm -rf $POETRY_CACHE_DIR
+
+# Create non-root user
+RUN useradd --create-home --shell /bin/bash app
+RUN chown -R app:app /app
+USER app
+
+# Default command
+CMD ["poetry", "shell"]

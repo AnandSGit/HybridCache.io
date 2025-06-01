@@ -1,0 +1,186 @@
+[tool.poetry]
+name = "hybridcache-storage"
+version = "1.0.0"
+description = "A comprehensive, high-performance database abstraction library for Python with async support"
+authors = ["HybridCache.io Team <support@hybridcache.io>"]
+license = "MIT"
+readme = "README.md"
+homepage = "https://github.com/HybridCache.io/storage-python"
+repository = "https://github.com/HybridCache.io/storage-python"
+documentation = "https://docs.hybridcache.io/storage-python"
+keywords = ["database", "async", "postgresql", "orm", "sql", "abstraction"]
+classifiers = [
+    "Development Status :: 5 - Production/Stable",
+    "Intended Audience :: Developers",
+    "License :: OSI Approved :: MIT License",
+    "Programming Language :: Python :: 3",
+    "Programming Language :: Python :: 3.11",
+    "Programming Language :: Python :: 3.12",
+    "Topic :: Database",
+    "Topic :: Software Development :: Libraries :: Python Modules",
+    "Framework :: AsyncIO",
+]
+packages = [{include = "storage", from = "src"}]
+
+[tool.poetry.dependencies]
+python = "^3.11"
+asyncpg = "^0.29.0"
+typing-extensions = "^4.8.0"
+pydantic = "^2.5.0"
+
+[tool.poetry.group.dev.dependencies]
+pytest = "^7.4.3"
+pytest-asyncio = "^0.21.1"
+pytest-cov = "^4.1.0"
+pytest-benchmark = "^4.0.0"
+pytest-xdist = "^3.5.0"
+testcontainers = {extras = ["postgresql"], version = "^3.7.1"}
+hypothesis = "^6.92.1"
+mypy = "^1.7.1"
+black = "^23.11.0"
+isort = "^5.12.0"
+ruff = "^0.1.6"
+bandit = "^1.7.5"
+safety = "^2.3.5"
+pre-commit = "^3.6.0"
+sphinx = "^7.2.6"
+sphinx-autodoc-typehints = "^1.25.2"
+sphinx-rtd-theme = "^1.3.0"
+py-spy = "^0.3.14"
+memory-profiler = "^0.61.0"
+
+[tool.poetry.group.examples.dependencies]
+asyncio-mqtt = "^0.16.1"
+aiofiles = "^23.2.1"
+rich = "^13.7.0"
+
+[build-system]
+requires = ["poetry-core"]
+build-backend = "poetry.core.masonry.api"
+
+[tool.black]
+line-length = 88
+target-version = ['py311']
+include = '\.pyi?$'
+extend-exclude = '''
+/(
+  # directories
+  \.eggs
+  | \.git
+  | \.hg
+  | \.mypy_cache
+  | \.tox
+  | \.venv
+  | build
+  | dist
+)/
+'''
+
+[tool.isort]
+profile = "black"
+multi_line_output = 3
+line_length = 88
+known_first_party = ["storage"]
+known_third_party = ["asyncpg", "pytest", "pydantic"]
+
+[tool.mypy]
+python_version = "3.11"
+strict = true
+warn_return_any = true
+warn_unused_configs = true
+disallow_untyped_defs = true
+disallow_incomplete_defs = true
+check_untyped_defs = true
+disallow_untyped_decorators = true
+no_implicit_optional = true
+warn_redundant_casts = true
+warn_unused_ignores = true
+warn_no_return = true
+warn_unreachable = true
+strict_equality = true
+show_error_codes = true
+
+[[tool.mypy.overrides]]
+module = "testcontainers.*"
+ignore_missing_imports = true
+
+[tool.ruff]
+target-version = "py311"
+line-length = 88
+select = [
+    "E",  # pycodestyle errors
+    "W",  # pycodestyle warnings
+    "F",  # pyflakes
+    "I",  # isort
+    "C",  # flake8-comprehensions
+    "B",  # flake8-bugbear
+    "UP", # pyupgrade
+    "N",  # pep8-naming
+    "S",  # bandit
+    "T20", # flake8-print
+    "PT", # flake8-pytest-style
+    "RET", # flake8-return
+    "SIM", # flake8-simplify
+    "TCH", # flake8-type-checking
+    "ARG", # flake8-unused-arguments
+    "PTH", # flake8-use-pathlib
+    "ERA", # eradicate
+    "PL", # pylint
+    "TRY", # tryceratops
+    "PERF", # perflint
+]
+ignore = [
+    "E501",  # line too long, handled by black
+    "B008",  # do not perform function calls in argument defaults
+    "C901",  # too complex
+    "PLR0913", # too many arguments
+    "PLR0912", # too many branches
+    "PLR0915", # too many statements
+    "S101",  # use of assert
+    "TRY003", # avoid specifying long messages outside exception class
+]
+
+[tool.ruff.per-file-ignores]
+"tests/*" = ["S101", "PLR2004", "ARG001", "ARG002"]
+"examples/*" = ["T20", "S101"]
+
+[tool.bandit]
+exclude_dirs = ["tests", "examples"]
+skips = ["B101", "B601"]
+
+[tool.pytest.ini_options]
+minversion = "7.0"
+addopts = "-ra -q --strict-markers --strict-config"
+testpaths = ["tests"]
+asyncio_mode = "auto"
+markers = [
+    "slow: marks tests as slow (deselect with '-m \"not slow\"')",
+    "integration: marks tests as integration tests",
+    "benchmark: marks tests as benchmark tests",
+]
+
+[tool.coverage.run]
+source = ["src"]
+branch = true
+omit = [
+    "*/tests/*",
+    "*/examples/*",
+    "*/__pycache__/*",
+]
+
+[tool.coverage.report]
+exclude_lines = [
+    "pragma: no cover",
+    "def __repr__",
+    "if self.debug:",
+    "if settings.DEBUG",
+    "raise AssertionError",
+    "raise NotImplementedError",
+    "if 0:",
+    "if __name__ == .__main__.:",
+    "class .*\\bProtocol\\):",
+    "@(abc\\.)?abstractmethod",
+]
+show_missing = true
+precision = 2
+fail_under = 95

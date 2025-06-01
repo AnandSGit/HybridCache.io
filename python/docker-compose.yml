@@ -1,0 +1,172 @@
+# Docker Compose for Database Agnostic Storage Library (Python)
+# Development and testing environment
+
+version: '3.8'
+
+services:
+  # PostgreSQL Database
+  postgres:
+    image: postgres:15-alpine
+    container_name: storage-python-postgres
+    environment:
+      POSTGRES_DB: testdb
+      POSTGRES_USER: testuser
+      POSTGRES_PASSWORD: testpass
+      POSTGRES_INITDB_ARGS: "--encoding=UTF-8 --lc-collate=C --lc-ctype=C"
+    ports:
+      - "5432:5432"
+    volumes:
+      - postgres_data:/var/lib/postgresql/data
+      - ./scripts/postgres-init.sql:/docker-entrypoint-initdb.d/init.sql
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U testuser -d testdb"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+    networks:
+      - storage-network
+
+  # Redis Cache
+  redis:
+    image: redis:7-alpine
+    container_name: storage-python-redis
+    ports:
+      - "6379:6379"
+    volumes:
+      - redis_data:/data
+      - ./scripts/redis.conf:/usr/local/etc/redis/redis.conf
+    command: redis-server /usr/local/etc/redis/redis.conf
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+    networks:
+      - storage-network
+
+  # MySQL Database (for future adapter)
+  mysql:
+    image: mysql:8.0
+    container_name: storage-python-mysql
+    environment:
+      MYSQL_ROOT_PASSWORD: rootpass
+      MYSQL_DATABASE: testdb
+      MYSQL_USER: testuser
+      MYSQL_PASSWORD: testpass
+    ports:
+      - "3306:3306"
+    volumes:
+      - mysql_data:/var/lib/mysql
+      - ./scripts/mysql-init.sql:/docker-entrypoint-initdb.d/init.sql
+    healthcheck:
+      test: ["CMD", "mysqladmin", "ping", "-h", "localhost", "-u", "testuser", "-ptestpass"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+    networks:
+      - storage-network
+
+  # MongoDB (for future adapter)
+  mongodb:
+    image: mongo:7
+    container_name: storage-python-mongodb
+    environment:
+      MONGO_INITDB_ROOT_USERNAME: testuser
+      MONGO_INITDB_ROOT_PASSWORD: testpass
+      MONGO_INITDB_DATABASE: testdb
+    ports:
+      - "27017:27017"
+    volumes:
+      - mongodb_data:/data/db
+      - ./scripts/mongo-init.js:/docker-entrypoint-initdb.d/init.js
+    healthcheck:
+      test: ["CMD", "mongosh", "--eval", "db.adminCommand('ping')"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+    networks:
+      - storage-network
+
+  # Application container for testing
+  app:
+    build:
+      context: .
+      dockerfile: Dockerfile.dev
+    container_name: storage-python-app
+    volumes:
+      - .:/app
+      - /app/.venv  # Exclude virtual environment
+    working_dir: /app
+    environment:
+      - PYTHONPATH=/app/src
+      - DATABASE_URL=postgresql://testuser:testpass@postgres:5432/testdb
+      - REDIS_URL=redis://redis:6379/0
+      - MYSQL_URL=mysql://testuser:testpass@mysql:3306/testdb
+      - MONGODB_URL=mongodb://testuser:testpass@mongodb:27017/testdb
+    depends_on:
+      postgres:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+    networks:
+      - storage-network
+    profiles:
+      - testing
+
+  # Test runner
+  test:
+    build:
+      context: .
+      dockerfile: Dockerfile.test
+    container_name: storage-python-test
+    volumes:
+      - .:/app
+      - test_cache:/app/.pytest_cache
+    working_dir: /app
+    environment:
+      - PYTHONPATH=/app/src
+      - DATABASE_URL=postgresql://testuser:testpass@postgres:5432/testdb
+      - REDIS_URL=redis://redis:6379/0
+    depends_on:
+      postgres:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+    networks:
+      - storage-network
+    profiles:
+      - testing
+
+  # Documentation server
+  docs:
+    build:
+      context: .
+      dockerfile: Dockerfile.dev
+    container_name: storage-python-docs
+    volumes:
+      - .:/app
+    working_dir: /app
+    ports:
+      - "8000:8000"
+    command: make docs-serve
+    networks:
+      - storage-network
+    profiles:
+      - docs
+
+volumes:
+  postgres_data:
+    driver: local
+  redis_data:
+    driver: local
+  mysql_data:
+    driver: local
+  mongodb_data:
+    driver: local
+  test_cache:
+    driver: local
+
+networks:
+  storage-network:
+    driver: bridge
+    name: storage-python-network
