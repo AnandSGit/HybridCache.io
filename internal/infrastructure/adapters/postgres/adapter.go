@@ -11,11 +11,9 @@ import (
 
 	"github.com/jackc/pgx/v5"
 	"github.com/jackc/pgx/v5/pgxpool"
-
-	"github.com/HybridCache.io/storage/pkg/storage"
 )
 
-// Adapter implements the storage.Adapter interface for PostgreSQL
+// Adapter implements the domain.Adapter interface for PostgreSQL
 type Adapter struct {
 	name    string
 	version string

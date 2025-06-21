@@ -1,4 +1,5 @@
-package storage
+// Package domain provides the core domain errors for the Database Agnostic Storage Library.
+package domain
 
 import (
 	"errors"
@@ -8,41 +9,41 @@ import (
 // Error types for the storage package
 var (
 	// Connection errors
-	ErrConnectionFailed    = errors.New("connection failed")
-	ErrConnectionTimeout   = errors.New("connection timeout")
-	ErrConnectionClosed    = errors.New("connection closed")
-	ErrConnectionPoolFull  = errors.New("connection pool full")
+	ErrConnectionFailed   = errors.New("connection failed")
+	ErrConnectionTimeout  = errors.New("connection timeout")
+	ErrConnectionClosed   = errors.New("connection closed")
+	ErrConnectionPoolFull = errors.New("connection pool full")
 	ErrInvalidDSN         = errors.New("invalid DSN")
 	ErrInvalidConfig      = errors.New("invalid configuration")
 
 	// Query errors
-	ErrInvalidQuery       = errors.New("invalid query")
-	ErrQueryTimeout       = errors.New("query timeout")
-	ErrQueryFailed        = errors.New("query failed")
-	ErrInvalidParameters  = errors.New("invalid parameters")
-	ErrUnsupportedQuery   = errors.New("unsupported query")
+	ErrInvalidQuery      = errors.New("invalid query")
+	ErrQueryTimeout      = errors.New("query timeout")
+	ErrQueryFailed       = errors.New("query failed")
+	ErrInvalidParameters = errors.New("invalid parameters")
+	ErrUnsupportedQuery  = errors.New("unsupported query")
 
 	// Transaction errors
-	ErrTransactionFailed   = errors.New("transaction failed")
-	ErrTransactionTimeout  = errors.New("transaction timeout")
-	ErrTransactionClosed   = errors.New("transaction closed")
-	ErrInvalidTransaction  = errors.New("invalid transaction")
+	ErrTransactionFailed  = errors.New("transaction failed")
+	ErrTransactionTimeout = errors.New("transaction timeout")
+	ErrTransactionClosed  = errors.New("transaction closed")
+	ErrInvalidTransaction = errors.New("invalid transaction")
 	ErrDeadlock           = errors.New("deadlock detected")
 
 	// Data errors
-	ErrNoRows             = errors.New("no rows found")
-	ErrTooManyRows        = errors.New("too many rows")
-	ErrInvalidData        = errors.New("invalid data")
-	ErrDataTruncated      = errors.New("data truncated")
+	ErrNoRows              = errors.New("no rows found")
+	ErrTooManyRows         = errors.New("too many rows")
+	ErrInvalidData         = errors.New("invalid data")
+	ErrDataTruncated       = errors.New("data truncated")
 	ErrConstraintViolation = errors.New("constraint violation")
-	ErrDuplicateKey       = errors.New("duplicate key")
+	ErrDuplicateKey        = errors.New("duplicate key")
 
 	// Schema errors
-	ErrTableNotFound      = errors.New("table not found")
-	ErrColumnNotFound     = errors.New("column not found")
-	ErrIndexNotFound      = errors.New("index not found")
-	ErrInvalidSchema      = errors.New("invalid schema")
-	ErrSchemaExists       = errors.New("schema already exists")
+	ErrTableNotFound  = errors.New("table not found")
+	ErrColumnNotFound = errors.New("column not found")
+	ErrIndexNotFound  = errors.New("index not found")
+	ErrInvalidSchema  = errors.New("invalid schema")
+	ErrSchemaExists   = errors.New("schema already exists")
 
 	// Adapter errors
 	ErrAdapterNotFound    = errors.New("adapter not found")
@@ -50,19 +51,19 @@ var (
 	ErrAdapterFailed      = errors.New("adapter failed")
 
 	// Migration errors
-	ErrMigrationFailed    = errors.New("migration failed")
-	ErrMigrationNotFound  = errors.New("migration not found")
-	ErrInvalidMigration   = errors.New("invalid migration")
+	ErrMigrationFailed   = errors.New("migration failed")
+	ErrMigrationNotFound = errors.New("migration not found")
+	ErrInvalidMigration  = errors.New("invalid migration")
 
 	// Cache errors
-	ErrCacheNotFound      = errors.New("cache entry not found")
-	ErrCacheFailed        = errors.New("cache operation failed")
-	ErrCacheTimeout       = errors.New("cache timeout")
+	ErrCacheNotFound = errors.New("cache entry not found")
+	ErrCacheFailed   = errors.New("cache operation failed")
+	ErrCacheTimeout  = errors.New("cache timeout")
 
 	// Generic errors
-	ErrNotImplemented     = errors.New("not implemented")
+	ErrNotImplemented       = errors.New("not implemented")
 	ErrUnsupportedOperation = errors.New("unsupported operation")
-	ErrInternalError      = errors.New("internal error")
+	ErrInternalError        = errors.New("internal error")
 )
 
 // ErrorType represents the category of error
@@ -144,11 +145,11 @@ func (e *StorageError) Is(target error) bool {
 	if target == nil {
 		return false
 	}
-	
+
 	if se, ok := target.(*StorageError); ok {
 		return e.Type == se.Type && e.Code == se.Code
 	}
-	
+
 	return errors.Is(e.Cause, target)
 }
 

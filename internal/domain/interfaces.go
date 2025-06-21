@@ -1,5 +1,6 @@
-// Package storage provides database-agnostic storage interfaces and types
-package storage
+// Package domain provides the core domain interfaces and types for the Database Agnostic Storage Library.
+// This package contains the business logic and domain rules that are independent of any specific database implementation.
+package domain
 
 import (
 	"context"

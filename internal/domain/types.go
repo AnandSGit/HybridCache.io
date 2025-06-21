@@ -1,4 +1,5 @@
-package storage
+// Package domain provides the core domain types for the Database Agnostic Storage Library.
+package domain
 
 import (
 	"database/sql/driver"

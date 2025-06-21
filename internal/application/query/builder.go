@@ -4,8 +4,6 @@ package query
 import (
 	"fmt"
 	"strings"
-
-	"github.com/HybridCache.io/storage/pkg/storage"
 )
 
 // Builder implements the QueryBuilder interface
