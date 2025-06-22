@@ -9,6 +9,7 @@ import (
 	"strings"
 	"time"
 
+	"github.com/AnandSGit/HybridCache.io/internal/domain"
 	"github.com/jackc/pgx/v5"
 	"github.com/jackc/pgx/v5/pgxpool"
 )
@@ -20,7 +21,7 @@ type Adapter struct {
 }
 
 // NewAdapter creates a new PostgreSQL adapter
-func NewAdapter() storage.Adapter {
+func NewAdapter() domain.Adapter {
 	return &Adapter{
 		name:    "postgresql",
 		version: "1.0.0",
@@ -38,24 +39,24 @@ func (a *Adapter) Version() string {
 }
 
 // DatabaseType returns the database type
-func (a *Adapter) DatabaseType() storage.DatabaseType {
-	return storage.DatabaseTypePostgreSQL
+func (a *Adapter) DatabaseType() domain.DatabaseType {
+	return domain.DatabaseTypePostgreSQL
 }
 
 // Connect creates a new storage instance
-func (a *Adapter) Connect(ctx context.Context, config storage.Config) (storage.Storage, error) {
+func (a *Adapter) Connect(ctx context.Context, config domain.Config) (domain.Storage, error) {
 	if err := a.ValidateConfig(config); err != nil {
-		return nil, storage.NewConnectionError("INVALID_CONFIG", err.Error()).WithCause(err)
+		return nil, domain.NewConnectionError("INVALID_CONFIG", err.Error()).WithCause(err)
 	}
 
 	dsn, err := a.buildDSN(config)
 	if err != nil {
-		return nil, storage.NewConnectionError("INVALID_DSN", "failed to build DSN").WithCause(err)
+		return nil, domain.NewConnectionError("INVALID_DSN", "failed to build DSN").WithCause(err)
 	}
 
 	poolConfig, err := pgxpool.ParseConfig(dsn)
 	if err != nil {
-		return nil, storage.NewConnectionError("INVALID_DSN", "failed to parse DSN").WithCause(err)
+		return nil, domain.NewConnectionError("INVALID_DSN", "failed to parse DSN").WithCause(err)
 	}
 
 	// Configure connection pool
@@ -71,13 +72,13 @@ func (a *Adapter) Connect(ctx context.Context, config storage.Config) (storage.S
 
 	pool, err := pgxpool.NewWithConfig(ctx, poolConfig)
 	if err != nil {
-		return nil, storage.NewConnectionError("CONNECTION_FAILED", "failed to create connection pool").WithCause(err)
+		return nil, domain.NewConnectionError("CONNECTION_FAILED", "failed to create connection pool").WithCause(err)
 	}
 
 	// Test the connection
 	if err := pool.Ping(ctx); err != nil {
 		pool.Close()
-		return nil, storage.NewConnectionError("CONNECTION_FAILED", "failed to ping database").WithCause(err)
+		return nil, domain.NewConnectionError("CONNECTION_FAILED", "failed to ping database").WithCause(err)
 	}
 
 	return &PostgreSQLStorage{
@@ -88,8 +89,8 @@ func (a *Adapter) Connect(ctx context.Context, config storage.Config) (storage.S
 }
 
 // ParseDSN parses a PostgreSQL DSN into a Config
-func (a *Adapter) ParseDSN(dsn string) (storage.Config, error) {
-	config := storage.Config{
+func (a *Adapter) ParseDSN(dsn string) (domain.Config, error) {
+	config := domain.Config{
 		Options: make(map[string]interface{}),
 	}
 
@@ -140,7 +141,7 @@ func (a *Adapter) ParseDSN(dsn string) (storage.Config, error) {
 }
 
 // ValidateConfig validates the configuration
-func (a *Adapter) ValidateConfig(config storage.Config) error {
+func (a *Adapter) ValidateConfig(config domain.Config) error {
 	if config.DSN == "" {
 		if config.Host == "" {
 			return fmt.Errorf("host is required")
@@ -168,8 +169,8 @@ func (a *Adapter) ValidateConfig(config storage.Config) error {
 	return nil
 }
 
-// TranslateQuery translates a storage.Query to PostgreSQL SQL
-func (a *Adapter) TranslateQuery(query storage.Query) (string, []interface{}, error) {
+// TranslateQuery translates a domain.Query to PostgreSQL SQL
+func (a *Adapter) TranslateQuery(query domain.Query) (string, []interface{}, error) {
 	// PostgreSQL uses $1, $2, etc. for parameters
 	sql := query.SQL
 	params := query.Parameters
@@ -189,63 +190,63 @@ func (a *Adapter) TranslateQuery(query storage.Query) (string, []interface{}, er
 	return result.String(), params, nil
 }
 
-// TranslateCommand translates a storage.Command to PostgreSQL SQL
-func (a *Adapter) TranslateCommand(command storage.Command) (string, []interface{}, error) {
-	return a.TranslateQuery(storage.Query{
+// TranslateCommand translates a domain.Command to PostgreSQL SQL
+func (a *Adapter) TranslateCommand(command domain.Command) (string, []interface{}, error) {
+	return a.TranslateQuery(domain.Query{
 		SQL:        command.SQL,
 		Parameters: command.Parameters,
 	})
 }
 
-// MapGoType maps a Go type to a storage.DataType
-func (a *Adapter) MapGoType(goType interface{}) (storage.DataType, error) {
+// MapGoType maps a Go type to a domain.DataType
+func (a *Adapter) MapGoType(goType interface{}) (domain.DataType, error) {
 	switch goType.(type) {
 	case string:
-		return storage.DataTypeString, nil
+		return domain.DataTypeString, nil
 	case int, int8, int16, int32, int64:
-		return storage.DataTypeInteger, nil
+		return domain.DataTypeInteger, nil
 	case uint, uint8, uint16, uint32, uint64:
-		return storage.DataTypeInteger, nil
+		return domain.DataTypeInteger, nil
 	case float32, float64:
-		return storage.DataTypeFloat, nil
+		return domain.DataTypeFloat, nil
 	case bool:
-		return storage.DataTypeBoolean, nil
+		return domain.DataTypeBoolean, nil
 	case time.Time:
-		return storage.DataTypeDateTime, nil
+		return domain.DataTypeDateTime, nil
 	case []byte:
-		return storage.DataTypeBinary, nil
+		return domain.DataTypeBinary, nil
 	default:
-		return storage.DataTypeUnknown, fmt.Errorf("unsupported Go type: %T", goType)
+		return domain.DataTypeUnknown, fmt.Errorf("unsupported Go type: %T", goType)
 	}
 }
 
-// MapDatabaseType maps a PostgreSQL type to a storage.DataType
-func (a *Adapter) MapDatabaseType(dbType string) (storage.DataType, error) {
+// MapDatabaseType maps a PostgreSQL type to a domain.DataType
+func (a *Adapter) MapDatabaseType(dbType string) (domain.DataType, error) {
 	switch strings.ToLower(dbType) {
 	case "text", "varchar", "char", "character", "character varying":
-		return storage.DataTypeString, nil
+		return domain.DataTypeString, nil
 	case "integer", "int", "int4", "bigint", "int8", "smallint", "int2":
-		return storage.DataTypeInteger, nil
+		return domain.DataTypeInteger, nil
 	case "real", "float4", "double precision", "float8", "numeric", "decimal":
-		return storage.DataTypeFloat, nil
+		return domain.DataTypeFloat, nil
 	case "boolean", "bool":
-		return storage.DataTypeBoolean, nil
+		return domain.DataTypeBoolean, nil
 	case "timestamp", "timestamptz", "timestamp with time zone", "timestamp without time zone":
-		return storage.DataTypeDateTime, nil
+		return domain.DataTypeDateTime, nil
 	case "date":
-		return storage.DataTypeDate, nil
+		return domain.DataTypeDate, nil
 	case "time", "timetz", "time with time zone", "time without time zone":
-		return storage.DataTypeTime, nil
+		return domain.DataTypeTime, nil
 	case "bytea":
-		return storage.DataTypeBinary, nil
+		return domain.DataTypeBinary, nil
 	case "json", "jsonb":
-		return storage.DataTypeJSON, nil
+		return domain.DataTypeJSON, nil
 	case "uuid":
-		return storage.DataTypeUUID, nil
+		return domain.DataTypeUUID, nil
 	case "array":
-		return storage.DataTypeArray, nil
+		return domain.DataTypeArray, nil
 	default:
-		return storage.DataTypeUnknown, fmt.Errorf("unsupported PostgreSQL type: %s", dbType)
+		return domain.DataTypeUnknown, fmt.Errorf("unsupported PostgreSQL type: %s", dbType)
 	}
 }
 
@@ -270,7 +271,7 @@ func (a *Adapter) SupportsSchema() bool {
 }
 
 // buildDSN builds a PostgreSQL DSN from the config
-func (a *Adapter) buildDSN(config storage.Config) (string, error) {
+func (a *Adapter) buildDSN(config domain.Config) (string, error) {
 	if config.DSN != "" {
 		return config.DSN, nil
 	}
@@ -326,10 +327,10 @@ func (a *Adapter) buildDSN(config storage.Config) (string, error) {
 	return strings.Join(parts, " "), nil
 }
 
-// PostgreSQLStorage implements the storage.Storage interface for PostgreSQL
+// PostgreSQLStorage implements the domain.Storage interface for PostgreSQL
 type PostgreSQLStorage struct {
 	pool    *pgxpool.Pool
-	config  storage.Config
+	config  domain.Config
 	adapter *Adapter
 }
 
@@ -350,20 +351,20 @@ func (s *PostgreSQLStorage) Ping(ctx context.Context) error {
 }
 
 // Health returns the health status
-func (s *PostgreSQLStorage) Health(ctx context.Context) storage.HealthStatus {
-	status := storage.HealthStatus{
+func (s *PostgreSQLStorage) Health(ctx context.Context) domain.HealthStatus {
+	status := domain.HealthStatus{
 		Timestamp: time.Now(),
 		Details:   make(map[string]interface{}),
 	}
 
 	if err := s.pool.Ping(ctx); err != nil {
-		status.Status = storage.HealthStatusUnhealthy
+		status.Status = domain.HealthStatusUnhealthy
 		status.Message = fmt.Sprintf("ping failed: %v", err)
 		return status
 	}
 
 	stats := s.pool.Stat()
-	status.Status = storage.HealthStatusHealthy
+	status.Status = domain.HealthStatusHealthy
 	status.Message = "connection pool healthy"
 	status.Details["total_connections"] = stats.TotalConns()
 	status.Details["idle_connections"] = stats.IdleConns()
@@ -373,8 +374,8 @@ func (s *PostgreSQLStorage) Health(ctx context.Context) storage.HealthStatus {
 }
 
 // Info returns storage information
-func (s *PostgreSQLStorage) Info() storage.StorageInfo {
-	return storage.StorageInfo{
+func (s *PostgreSQLStorage) Info() domain.StorageInfo {
+	return domain.StorageInfo{
 		Name:         s.adapter.Name(),
 		Version:      s.adapter.Version(),
 		DatabaseType: s.adapter.DatabaseType(),
@@ -387,7 +388,7 @@ func (s *PostgreSQLStorage) Info() storage.StorageInfo {
 			"arrays",
 			"full-text-search",
 		},
-		Limits: storage.StorageLimits{
+		Limits: domain.StorageLimits{
 			MaxConnections:    s.config.MaxOpenConns,
 			MaxQuerySize:      1024 * 1024 * 1024, // 1GB
 			MaxTransactionAge: 24 * time.Hour,
@@ -397,25 +398,25 @@ func (s *PostgreSQLStorage) Info() storage.StorageInfo {
 }
 
 // Query executes a query and returns results
-func (s *PostgreSQLStorage) Query(ctx context.Context, query storage.Query) (storage.Result, error) {
+func (s *PostgreSQLStorage) Query(ctx context.Context, query domain.Query) (domain.Result, error) {
 	sql, params, err := s.adapter.TranslateQuery(query)
 	if err != nil {
-		return nil, storage.NewQueryError("QUERY_TRANSLATION_FAILED", err.Error()).WithCause(err)
+		return nil, domain.NewQueryError("QUERY_TRANSLATION_FAILED", err.Error()).WithCause(err)
 	}
 
 	rows, err := s.pool.Query(ctx, sql, params...)
 	if err != nil {
-		return nil, storage.NewQueryError("QUERY_EXECUTION_FAILED", err.Error()).WithCause(err)
+		return nil, domain.NewQueryError("QUERY_EXECUTION_FAILED", err.Error()).WithCause(err)
 	}
 
 	return &PostgreSQLResult{rows: rows}, nil
 }
 
 // QueryOne executes a query and returns a single row
-func (s *PostgreSQLStorage) QueryOne(ctx context.Context, query storage.Query) (storage.Row, error) {
+func (s *PostgreSQLStorage) QueryOne(ctx context.Context, query domain.Query) (domain.Row, error) {
 	sql, params, err := s.adapter.TranslateQuery(query)
 	if err != nil {
-		return nil, storage.NewQueryError("QUERY_TRANSLATION_FAILED", err.Error()).WithCause(err)
+		return nil, domain.NewQueryError("QUERY_TRANSLATION_FAILED", err.Error()).WithCause(err)
 	}
 
 	row := s.pool.QueryRow(ctx, sql, params...)
@@ -423,36 +424,36 @@ func (s *PostgreSQLStorage) QueryOne(ctx context.Context, query storage.Query) (
 }
 
 // Execute executes a command and returns the result
-func (s *PostgreSQLStorage) Execute(ctx context.Context, command storage.Command) (storage.ExecuteResult, error) {
+func (s *PostgreSQLStorage) Execute(ctx context.Context, command domain.Command) (domain.ExecuteResult, error) {
 	sql, params, err := s.adapter.TranslateCommand(command)
 	if err != nil {
-		return storage.ExecuteResult{}, storage.NewQueryError("COMMAND_TRANSLATION_FAILED", err.Error()).WithCause(err)
+		return domain.ExecuteResult{}, domain.NewQueryError("COMMAND_TRANSLATION_FAILED", err.Error()).WithCause(err)
 	}
 
 	result, err := s.pool.Exec(ctx, sql, params...)
 	if err != nil {
-		return storage.ExecuteResult{}, storage.NewQueryError("COMMAND_EXECUTION_FAILED", err.Error()).WithCause(err)
+		return domain.ExecuteResult{}, domain.NewQueryError("COMMAND_EXECUTION_FAILED", err.Error()).WithCause(err)
 	}
 
-	return storage.ExecuteResult{
+	return domain.ExecuteResult{
 		RowsAffected: result.RowsAffected(),
 		LastInsertID: 0, // PostgreSQL doesn't support LastInsertID
 	}, nil
 }
 
 // BeginTx starts a new transaction
-func (s *PostgreSQLStorage) BeginTx(ctx context.Context, opts *storage.TxOptions) (storage.Transaction, error) {
+func (s *PostgreSQLStorage) BeginTx(ctx context.Context, opts *domain.TxOptions) (domain.Transaction, error) {
 	var pgxOpts pgx.TxOptions
 
 	if opts != nil {
 		switch opts.Isolation {
-		case storage.IsolationLevelReadUncommitted:
+		case domain.IsolationLevelReadUncommitted:
 			pgxOpts.IsoLevel = pgx.ReadUncommitted
-		case storage.IsolationLevelReadCommitted:
+		case domain.IsolationLevelReadCommitted:
 			pgxOpts.IsoLevel = pgx.ReadCommitted
-		case storage.IsolationLevelRepeatableRead:
+		case domain.IsolationLevelRepeatableRead:
 			pgxOpts.IsoLevel = pgx.RepeatableRead
-		case storage.IsolationLevelSerializable:
+		case domain.IsolationLevelSerializable:
 			pgxOpts.IsoLevel = pgx.Serializable
 		default:
 			pgxOpts.IsoLevel = pgx.ReadCommitted
@@ -465,7 +466,7 @@ func (s *PostgreSQLStorage) BeginTx(ctx context.Context, opts *storage.TxOptions
 
 	tx, err := s.pool.BeginTx(ctx, pgxOpts)
 	if err != nil {
-		return nil, storage.NewTransactionError("TRANSACTION_BEGIN_FAILED", err.Error()).WithCause(err)
+		return nil, domain.NewTransactionError("TRANSACTION_BEGIN_FAILED", err.Error()).WithCause(err)
 	}
 
 	return &PostgreSQLTransaction{
@@ -477,30 +478,30 @@ func (s *PostgreSQLStorage) BeginTx(ctx context.Context, opts *storage.TxOptions
 }
 
 // Batch executes multiple operations in a batch
-func (s *PostgreSQLStorage) Batch(ctx context.Context, operations []storage.Operation) ([]storage.OperationResult, error) {
-	results := make([]storage.OperationResult, len(operations))
+func (s *PostgreSQLStorage) Batch(ctx context.Context, operations []domain.Operation) ([]domain.OperationResult, error) {
+	results := make([]domain.OperationResult, len(operations))
 
 	batch := &pgx.Batch{}
 
 	// Add all operations to the batch
 	for i, op := range operations {
 		switch op.Type {
-		case storage.OperationTypeQuery:
+		case domain.OperationTypeQuery:
 			sql, params, err := s.adapter.TranslateQuery(op.Query)
 			if err != nil {
-				results[i] = storage.OperationResult{
+				results[i] = domain.OperationResult{
 					Index: i,
-					Error: storage.NewQueryError("QUERY_TRANSLATION_FAILED", err.Error()).WithCause(err),
+					Error: domain.NewQueryError("QUERY_TRANSLATION_FAILED", err.Error()).WithCause(err),
 				}
 				continue
 			}
 			batch.Queue(sql, params...)
-		case storage.OperationTypeCommand:
+		case domain.OperationTypeCommand:
 			sql, params, err := s.adapter.TranslateCommand(op.Command)
 			if err != nil {
-				results[i] = storage.OperationResult{
+				results[i] = domain.OperationResult{
 					Index: i,
-					Error: storage.NewQueryError("COMMAND_TRANSLATION_FAILED", err.Error()).WithCause(err),
+					Error: domain.NewQueryError("COMMAND_TRANSLATION_FAILED", err.Error()).WithCause(err),
 				}
 				continue
 			}
@@ -519,30 +520,30 @@ func (s *PostgreSQLStorage) Batch(ctx context.Context, operations []storage.Oper
 		}
 
 		switch op.Type {
-		case storage.OperationTypeQuery:
+		case domain.OperationTypeQuery:
 			rows, err := batchResults.Query()
 			if err != nil {
-				results[i] = storage.OperationResult{
+				results[i] = domain.OperationResult{
 					Index: i,
-					Error: storage.NewQueryError("BATCH_QUERY_FAILED", err.Error()).WithCause(err),
+					Error: domain.NewQueryError("BATCH_QUERY_FAILED", err.Error()).WithCause(err),
 				}
 			} else {
-				results[i] = storage.OperationResult{
+				results[i] = domain.OperationResult{
 					Index:  i,
 					Result: &PostgreSQLResult{rows: rows},
 				}
 			}
-		case storage.OperationTypeCommand:
+		case domain.OperationTypeCommand:
 			cmdTag, err := batchResults.Exec()
 			if err != nil {
-				results[i] = storage.OperationResult{
+				results[i] = domain.OperationResult{
 					Index: i,
-					Error: storage.NewQueryError("BATCH_COMMAND_FAILED", err.Error()).WithCause(err),
+					Error: domain.NewQueryError("BATCH_COMMAND_FAILED", err.Error()).WithCause(err),
 				}
 			} else {
-				results[i] = storage.OperationResult{
+				results[i] = domain.OperationResult{
 					Index: i,
-					Result: storage.ExecuteResult{
+					Result: domain.ExecuteResult{
 						RowsAffected: cmdTag.RowsAffected(),
 						LastInsertID: 0,
 					},
@@ -555,11 +556,11 @@ func (s *PostgreSQLStorage) Batch(ctx context.Context, operations []storage.Oper
 }
 
 // Schema operations
-func (s *PostgreSQLStorage) CreateTable(ctx context.Context, schema storage.TableSchema) error {
+func (s *PostgreSQLStorage) CreateTable(ctx context.Context, schema domain.TableSchema) error {
 	sql := s.buildCreateTableSQL(schema)
 	_, err := s.pool.Exec(ctx, sql)
 	if err != nil {
-		return storage.NewSchemaError("CREATE_TABLE_FAILED", err.Error()).WithCause(err)
+		return domain.NewSchemaError("CREATE_TABLE_FAILED", err.Error()).WithCause(err)
 	}
 	return nil
 }
@@ -568,18 +569,18 @@ func (s *PostgreSQLStorage) DropTable(ctx context.Context, tableName string) err
 	sql := fmt.Sprintf("DROP TABLE IF EXISTS %s", tableName)
 	_, err := s.pool.Exec(ctx, sql)
 	if err != nil {
-		return storage.NewSchemaError("DROP_TABLE_FAILED", err.Error()).WithCause(err)
+		return domain.NewSchemaError("DROP_TABLE_FAILED", err.Error()).WithCause(err)
 	}
 	return nil
 }
 
-func (s *PostgreSQLStorage) AlterTable(ctx context.Context, tableName string, changes []storage.SchemaChange) error {
+func (s *PostgreSQLStorage) AlterTable(ctx context.Context, tableName string, changes []domain.SchemaChange) error {
 	for _, change := range changes {
 		sql := s.buildAlterTableSQL(tableName, change)
 		if sql != "" {
 			_, err := s.pool.Exec(ctx, sql)
 			if err != nil {
-				return storage.NewSchemaError("ALTER_TABLE_FAILED", err.Error()).WithCause(err)
+				return domain.NewSchemaError("ALTER_TABLE_FAILED", err.Error()).WithCause(err)
 			}
 		}
 	}
@@ -592,7 +593,7 @@ func (s *PostgreSQLStorage) ListTables(ctx context.Context) ([]string, error) {
 
 	rows, err := s.pool.Query(ctx, sql)
 	if err != nil {
-		return nil, storage.NewSchemaError("LIST_TABLES_FAILED", err.Error()).WithCause(err)
+		return nil, domain.NewSchemaError("LIST_TABLES_FAILED", err.Error()).WithCause(err)
 	}
 	defer rows.Close()
 
@@ -600,7 +601,7 @@ func (s *PostgreSQLStorage) ListTables(ctx context.Context) ([]string, error) {
 	for rows.Next() {
 		var tableName string
 		if err := rows.Scan(&tableName); err != nil {
-			return nil, storage.NewSchemaError("SCAN_TABLE_NAME_FAILED", err.Error()).WithCause(err)
+			return nil, domain.NewSchemaError("SCAN_TABLE_NAME_FAILED", err.Error()).WithCause(err)
 		}
 		tables = append(tables, tableName)
 	}
@@ -608,10 +609,10 @@ func (s *PostgreSQLStorage) ListTables(ctx context.Context) ([]string, error) {
 	return tables, nil
 }
 
-func (s *PostgreSQLStorage) DescribeTable(ctx context.Context, tableName string) (storage.TableSchema, error) {
-	schema := storage.TableSchema{
+func (s *PostgreSQLStorage) DescribeTable(ctx context.Context, tableName string) (domain.TableSchema, error) {
+	schema := domain.TableSchema{
 		Name:    tableName,
-		Columns: []storage.ColumnDefinition{},
+		Columns: []domain.ColumnDefinition{},
 	}
 
 	sql := `SELECT column_name, data_type, is_nullable, column_default, character_maximum_length
@@ -621,7 +622,7 @@ func (s *PostgreSQLStorage) DescribeTable(ctx context.Context, tableName string)
 
 	rows, err := s.pool.Query(ctx, sql, tableName)
 	if err != nil {
-		return schema, storage.NewSchemaError("DESCRIBE_TABLE_FAILED", err.Error()).WithCause(err)
+		return schema, domain.NewSchemaError("DESCRIBE_TABLE_FAILED", err.Error()).WithCause(err)
 	}
 	defer rows.Close()
 
@@ -631,12 +632,12 @@ func (s *PostgreSQLStorage) DescribeTable(ctx context.Context, tableName string)
 		var maxLength *int64
 
 		if err := rows.Scan(&columnName, &dataType, &isNullable, &columnDefault, &maxLength); err != nil {
-			return schema, storage.NewSchemaError("SCAN_COLUMN_FAILED", err.Error()).WithCause(err)
+			return schema, domain.NewSchemaError("SCAN_COLUMN_FAILED", err.Error()).WithCause(err)
 		}
 
 		storageType, _ := s.adapter.MapDatabaseType(dataType)
 
-		column := storage.ColumnDefinition{
+		column := domain.ColumnDefinition{
 			Name:     columnName,
 			DataType: storageType,
 			Nullable: isNullable == "YES",
@@ -657,7 +658,7 @@ func (s *PostgreSQLStorage) DescribeTable(ctx context.Context, tableName string)
 }
 
 // Helper methods for schema operations
-func (s *PostgreSQLStorage) buildCreateTableSQL(schema storage.TableSchema) string {
+func (s *PostgreSQLStorage) buildCreateTableSQL(schema domain.TableSchema) string {
 	var parts []string
 	parts = append(parts, fmt.Sprintf("CREATE TABLE %s (", schema.Name))
 
@@ -673,7 +674,7 @@ func (s *PostgreSQLStorage) buildCreateTableSQL(schema storage.TableSchema) stri
 	return strings.Join(parts, "")
 }
 
-func (s *PostgreSQLStorage) buildColumnDefinition(col storage.ColumnDefinition) string {
+func (s *PostgreSQLStorage) buildColumnDefinition(col domain.ColumnDefinition) string {
 	var parts []string
 	parts = append(parts, col.Name)
 
@@ -700,14 +701,14 @@ func (s *PostgreSQLStorage) buildColumnDefinition(col storage.ColumnDefinition) 
 	return strings.Join(parts, " ")
 }
 
-func (s *PostgreSQLStorage) buildAlterTableSQL(tableName string, change storage.SchemaChange) string {
+func (s *PostgreSQLStorage) buildAlterTableSQL(tableName string, change domain.SchemaChange) string {
 	switch change.Type {
-	case storage.SchemaChangeTypeAddColumn:
+	case domain.SchemaChangeTypeAddColumn:
 		colDef := s.buildColumnDefinition(change.Column)
 		return fmt.Sprintf("ALTER TABLE %s ADD COLUMN %s", tableName, colDef)
-	case storage.SchemaChangeTypeDropColumn:
+	case domain.SchemaChangeTypeDropColumn:
 		return fmt.Sprintf("ALTER TABLE %s DROP COLUMN %s", tableName, change.Column.Name)
-	case storage.SchemaChangeTypeModifyColumn:
+	case domain.SchemaChangeTypeModifyColumn:
 		colDef := s.buildColumnDefinition(change.Column)
 		return fmt.Sprintf("ALTER TABLE %s ALTER COLUMN %s", tableName, colDef)
 	default:
@@ -715,36 +716,36 @@ func (s *PostgreSQLStorage) buildAlterTableSQL(tableName string, change storage.
 	}
 }
 
-func (s *PostgreSQLStorage) mapStorageTypeToPostgreSQL(dataType storage.DataType, length int64) string {
+func (s *PostgreSQLStorage) mapStorageTypeToPostgreSQL(dataType domain.DataType, length int64) string {
 	switch dataType {
-	case storage.DataTypeString:
+	case domain.DataTypeString:
 		if length > 0 {
 			return fmt.Sprintf("VARCHAR(%d)", length)
 		}
 		return "TEXT"
-	case storage.DataTypeInteger:
+	case domain.DataTypeInteger:
 		return "INTEGER"
-	case storage.DataTypeFloat:
+	case domain.DataTypeFloat:
 		return "DOUBLE PRECISION"
-	case storage.DataTypeBoolean:
+	case domain.DataTypeBoolean:
 		return "BOOLEAN"
-	case storage.DataTypeDateTime:
+	case domain.DataTypeDateTime:
 		return "TIMESTAMP"
-	case storage.DataTypeDate:
+	case domain.DataTypeDate:
 		return "DATE"
-	case storage.DataTypeTime:
+	case domain.DataTypeTime:
 		return "TIME"
-	case storage.DataTypeBinary:
+	case domain.DataTypeBinary:
 		return "BYTEA"
-	case storage.DataTypeJSON:
+	case domain.DataTypeJSON:
 		return "JSONB"
-	case storage.DataTypeUUID:
+	case domain.DataTypeUUID:
 		return "UUID"
-	case storage.DataTypeArray:
+	case domain.DataTypeArray:
 		return "TEXT[]"
-	case storage.DataTypeDecimal:
+	case domain.DataTypeDecimal:
 		return "DECIMAL"
-	case storage.DataTypeText:
+	case domain.DataTypeText:
 		return "TEXT"
 	default:
 		return "TEXT"

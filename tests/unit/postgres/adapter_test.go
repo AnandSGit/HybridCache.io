@@ -3,40 +3,40 @@ package postgres
 import (
 	"testing"
 
+	"github.com/AnandSGit/HybridCache.io/internal/domain"
+	"github.com/AnandSGit/HybridCache.io/pkg/storage"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
-
-	"github.com/HybridCache.io/storage/pkg/storage"
 )
 
 func TestAdapter_Name(t *testing.T) {
-	adapter := NewAdapter()
+	adapter := storage.NewPostgreSQLAdapter()
 	assert.Equal(t, "postgresql", adapter.Name())
 }
 
 func TestAdapter_Version(t *testing.T) {
-	adapter := NewAdapter()
+	adapter := storage.NewPostgreSQLAdapter()
 	assert.Equal(t, "1.0.0", adapter.Version())
 }
 
 func TestAdapter_DatabaseType(t *testing.T) {
-	adapter := NewAdapter()
-	assert.Equal(t, storage.DatabaseTypePostgreSQL, adapter.DatabaseType())
+	adapter := storage.NewPostgreSQLAdapter()
+	assert.Equal(t, domain.DatabaseTypePostgreSQL, adapter.DatabaseType())
 }
 
 func TestAdapter_ParseDSN(t *testing.T) {
-	adapter := NewAdapter()
+	adapter := storage.NewPostgreSQLAdapter()
 
 	tests := []struct {
 		name     string
 		dsn      string
-		expected storage.Config
+		expected domain.Config
 		wantErr  bool
 	}{
 		{
 			name: "postgres URL",
 			dsn:  "postgres://user:pass@localhost:5432/dbname?sslmode=require",
-			expected: storage.Config{
+			expected: domain.Config{
 				Host:     "localhost",
 				Port:     5432,
 				Database: "dbname",
@@ -50,7 +50,7 @@ func TestAdapter_ParseDSN(t *testing.T) {
 		{
 			name: "postgresql URL",
 			dsn:  "postgresql://user:pass@localhost:5432/dbname",
-			expected: storage.Config{
+			expected: domain.Config{
 				Host:     "localhost",
 				Port:     5432,
 				Database: "dbname",
@@ -63,7 +63,7 @@ func TestAdapter_ParseDSN(t *testing.T) {
 		{
 			name: "key=value format",
 			dsn:  "host=localhost port=5432 dbname=test user=postgres password=secret",
-			expected: storage.Config{
+			expected: domain.Config{
 				DSN:     "host=localhost port=5432 dbname=test user=postgres password=secret",
 				Options: map[string]interface{}{},
 			},
@@ -91,17 +91,17 @@ func TestAdapter_ParseDSN(t *testing.T) {
 }
 
 func TestAdapter_ValidateConfig(t *testing.T) {
-	adapter := NewAdapter()
+	adapter := storage.NewPostgreSQLAdapter()
 
 	tests := []struct {
 		name    string
-		config  storage.Config
+		config  domain.Config
 		wantErr bool
 		errMsg  string
 	}{
 		{
 			name: "valid config with DSN",
-			config: storage.Config{
+			config: domain.Config{
 				DSN:          "postgres://user:pass@localhost:5432/dbname",
 				MaxOpenConns: 10,
 				MaxIdleConns: 5,
@@ -110,7 +110,7 @@ func TestAdapter_ValidateConfig(t *testing.T) {
 		},
 		{
 			name: "valid config without DSN",
-			config: storage.Config{
+			config: domain.Config{
 				Host:         "localhost",
 				Database:     "testdb",
 				Username:     "testuser",
@@ -121,7 +121,7 @@ func TestAdapter_ValidateConfig(t *testing.T) {
 		},
 		{
 			name: "missing host",
-			config: storage.Config{
+			config: domain.Config{
 				Database:     "testdb",
 				Username:     "testuser",
 				MaxOpenConns: 10,
@@ -132,7 +132,7 @@ func TestAdapter_ValidateConfig(t *testing.T) {
 		},
 		{
 			name: "missing database",
-			config: storage.Config{
+			config: domain.Config{
 				Host:         "localhost",
 				Username:     "testuser",
 				MaxOpenConns: 10,
@@ -143,7 +143,7 @@ func TestAdapter_ValidateConfig(t *testing.T) {
 		},
 		{
 			name: "missing username",
-			config: storage.Config{
+			config: domain.Config{
 				Host:         "localhost",
 				Database:     "testdb",
 				MaxOpenConns: 10,
@@ -154,7 +154,7 @@ func TestAdapter_ValidateConfig(t *testing.T) {
 		},
 		{
 			name: "invalid max open connections",
-			config: storage.Config{
+			config: domain.Config{
 				DSN:          "postgres://user:pass@localhost:5432/dbname",
 				MaxOpenConns: 0,
 				MaxIdleConns: 5,
@@ -164,7 +164,7 @@ func TestAdapter_ValidateConfig(t *testing.T) {
 		},
 		{
 			name: "negative max idle connections",
-			config: storage.Config{
+			config: domain.Config{
 				DSN:          "postgres://user:pass@localhost:5432/dbname",
 				MaxOpenConns: 10,
 				MaxIdleConns: -1,
@@ -174,7 +174,7 @@ func TestAdapter_ValidateConfig(t *testing.T) {
 		},
 		{
 			name: "max idle > max open",
-			config: storage.Config{
+			config: domain.Config{
 				DSN:          "postgres://user:pass@localhost:5432/dbname",
 				MaxOpenConns: 5,
 				MaxIdleConns: 10,
@@ -198,17 +198,17 @@ func TestAdapter_ValidateConfig(t *testing.T) {
 }
 
 func TestAdapter_TranslateQuery(t *testing.T) {
-	adapter := NewAdapter()
+	adapter := storage.NewPostgreSQLAdapter()
 
 	tests := []struct {
 		name     string
-		query    storage.Query
+		query    domain.Query
 		expected string
 		params   []interface{}
 	}{
 		{
 			name: "simple query with parameters",
-			query: storage.Query{
+			query: domain.Query{
 				SQL:        "SELECT * FROM users WHERE id = ? AND name = ?",
 				Parameters: []interface{}{1, "John"},
 			},
@@ -217,7 +217,7 @@ func TestAdapter_TranslateQuery(t *testing.T) {
 		},
 		{
 			name: "query without parameters",
-			query: storage.Query{
+			query: domain.Query{
 				SQL:        "SELECT * FROM users",
 				Parameters: []interface{}{},
 			},
@@ -226,7 +226,7 @@ func TestAdapter_TranslateQuery(t *testing.T) {
 		},
 		{
 			name: "query with multiple placeholders",
-			query: storage.Query{
+			query: domain.Query{
 				SQL:        "INSERT INTO users (name, email, age) VALUES (?, ?, ?)",
 				Parameters: []interface{}{"John", "john@example.com", 30},
 			},
@@ -246,23 +246,23 @@ func TestAdapter_TranslateQuery(t *testing.T) {
 }
 
 func TestAdapter_MapGoType(t *testing.T) {
-	adapter := NewAdapter()
+	adapter := storage.NewPostgreSQLAdapter()
 
 	tests := []struct {
 		name     string
 		goType   interface{}
-		expected storage.DataType
+		expected domain.DataType
 		wantErr  bool
 	}{
-		{"string", "hello", storage.DataTypeString, false},
-		{"int", 42, storage.DataTypeInteger, false},
-		{"int32", int32(42), storage.DataTypeInteger, false},
-		{"int64", int64(42), storage.DataTypeInteger, false},
-		{"float32", float32(3.14), storage.DataTypeFloat, false},
-		{"float64", 3.14, storage.DataTypeFloat, false},
-		{"bool", true, storage.DataTypeBoolean, false},
-		{"[]byte", []byte("data"), storage.DataTypeBinary, false},
-		{"unsupported", make(chan int), storage.DataTypeUnknown, true},
+		{"string", "hello", domain.DataTypeString, false},
+		{"int", 42, domain.DataTypeInteger, false},
+		{"int32", int32(42), domain.DataTypeInteger, false},
+		{"int64", int64(42), domain.DataTypeInteger, false},
+		{"float32", float32(3.14), domain.DataTypeFloat, false},
+		{"float64", 3.14, domain.DataTypeFloat, false},
+		{"bool", true, domain.DataTypeBoolean, false},
+		{"[]byte", []byte("data"), domain.DataTypeBinary, false},
+		{"unsupported", make(chan int), domain.DataTypeUnknown, true},
 	}
 
 	for _, tt := range tests {
@@ -279,28 +279,28 @@ func TestAdapter_MapGoType(t *testing.T) {
 }
 
 func TestAdapter_MapDatabaseType(t *testing.T) {
-	adapter := NewAdapter()
+	adapter := storage.NewPostgreSQLAdapter()
 
 	tests := []struct {
 		name     string
 		dbType   string
-		expected storage.DataType
+		expected domain.DataType
 		wantErr  bool
 	}{
-		{"text", "text", storage.DataTypeString, false},
-		{"varchar", "varchar", storage.DataTypeString, false},
-		{"integer", "integer", storage.DataTypeInteger, false},
-		{"bigint", "bigint", storage.DataTypeInteger, false},
-		{"boolean", "boolean", storage.DataTypeBoolean, false},
-		{"timestamp", "timestamp", storage.DataTypeDateTime, false},
-		{"date", "date", storage.DataTypeDate, false},
-		{"time", "time", storage.DataTypeTime, false},
-		{"bytea", "bytea", storage.DataTypeBinary, false},
-		{"json", "json", storage.DataTypeJSON, false},
-		{"jsonb", "jsonb", storage.DataTypeJSON, false},
-		{"uuid", "uuid", storage.DataTypeUUID, false},
-		{"array", "array", storage.DataTypeArray, false},
-		{"unsupported", "unknown_type", storage.DataTypeUnknown, true},
+		{"text", "text", domain.DataTypeString, false},
+		{"varchar", "varchar", domain.DataTypeString, false},
+		{"integer", "integer", domain.DataTypeInteger, false},
+		{"bigint", "bigint", domain.DataTypeInteger, false},
+		{"boolean", "boolean", domain.DataTypeBoolean, false},
+		{"timestamp", "timestamp", domain.DataTypeDateTime, false},
+		{"date", "date", domain.DataTypeDate, false},
+		{"time", "time", domain.DataTypeTime, false},
+		{"bytea", "bytea", domain.DataTypeBinary, false},
+		{"json", "json", domain.DataTypeJSON, false},
+		{"jsonb", "jsonb", domain.DataTypeJSON, false},
+		{"uuid", "uuid", domain.DataTypeUUID, false},
+		{"array", "array", domain.DataTypeArray, false},
+		{"unsupported", "unknown_type", domain.DataTypeUnknown, true},
 	}
 
 	for _, tt := range tests {
@@ -317,7 +317,7 @@ func TestAdapter_MapDatabaseType(t *testing.T) {
 }
 
 func TestAdapter_FeatureSupport(t *testing.T) {
-	adapter := NewAdapter()
+	adapter := storage.NewPostgreSQLAdapter()
 
 	assert.True(t, adapter.SupportsTransactions())
 	assert.True(t, adapter.SupportsJoins())

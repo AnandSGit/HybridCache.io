@@ -6,7 +6,7 @@ import (
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 
-	"github.com/HybridCache.io/storage/pkg/storage"
+	"github.com/AnandSGit/HybridCache.io/pkg/storage"
 )
 
 func TestQueryBuilder_Select(t *testing.T) {
@@ -22,12 +22,12 @@ func TestQueryBuilder_Select(t *testing.T) {
 
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
-			builder := NewBuilder()
+			builder := storage.NewBuilder()
 			if len(tt.fields) > 0 {
 				builder.Select(tt.fields...)
 			}
 			builder.From("users")
-			
+
 			query, err := builder.Build()
 			require.NoError(t, err)
 			assert.Contains(t, query.SQL, tt.expected)
@@ -36,9 +36,9 @@ func TestQueryBuilder_Select(t *testing.T) {
 }
 
 func TestQueryBuilder_SelectDistinct(t *testing.T) {
-	builder := NewBuilder()
+	builder := storage.NewBuilder()
 	builder.SelectDistinct("category").From("products")
-	
+
 	query, err := builder.Build()
 	require.NoError(t, err)
 	assert.Contains(t, query.SQL, "SELECT DISTINCT category")
@@ -56,9 +56,9 @@ func TestQueryBuilder_SelectCount(t *testing.T) {
 
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
-			builder := NewBuilder()
+			builder := storage.NewBuilder()
 			builder.SelectCount(tt.field).From("users")
-			
+
 			query, err := builder.Build()
 			require.NoError(t, err)
 			assert.Contains(t, query.SQL, tt.expected)
@@ -67,15 +67,15 @@ func TestQueryBuilder_SelectCount(t *testing.T) {
 }
 
 func TestQueryBuilder_Where(t *testing.T) {
-	builder := NewBuilder()
+	builder := storage.NewBuilder()
 	builder.Select("*").
 		From("users").
-		Where(Equal("active", true)).
-		Where(GreaterThan("age", 18))
-	
+		Where(storage.Equal("active", true)).
+		Where(storage.GreaterThan("age", 18))
+
 	query, err := builder.Build()
 	require.NoError(t, err)
-	
+
 	assert.Contains(t, query.SQL, "WHERE")
 	assert.Contains(t, query.SQL, "active = ?")
 	assert.Contains(t, query.SQL, "age > ?")
@@ -83,72 +83,72 @@ func TestQueryBuilder_Where(t *testing.T) {
 }
 
 func TestQueryBuilder_Join(t *testing.T) {
-	builder := NewBuilder()
+	builder := storage.NewBuilder()
 	builder.Select("u.name", "p.title").
 		From("users u").
-		InnerJoin("posts p", Equal("p.user_id", "u.id"))
-	
+		InnerJoin("posts p", storage.Equal("p.user_id", "u.id"))
+
 	query, err := builder.Build()
 	require.NoError(t, err)
-	
+
 	assert.Contains(t, query.SQL, "INNER JOIN posts p ON p.user_id = ?")
 	assert.Equal(t, []interface{}{"u.id"}, query.Parameters)
 }
 
 func TestQueryBuilder_OrderBy(t *testing.T) {
-	builder := NewBuilder()
+	builder := storage.NewBuilder()
 	builder.Select("*").
 		From("users").
 		OrderBy("name", storage.SortDirectionAsc).
 		OrderByDesc("created_at")
-	
+
 	query, err := builder.Build()
 	require.NoError(t, err)
-	
+
 	assert.Contains(t, query.SQL, "ORDER BY name ASC, created_at DESC")
 }
 
 func TestQueryBuilder_LimitOffset(t *testing.T) {
-	builder := NewBuilder()
+	builder := storage.NewBuilder()
 	builder.Select("*").
 		From("users").
 		Limit(10).
 		Offset(20)
-	
+
 	query, err := builder.Build()
 	require.NoError(t, err)
-	
+
 	assert.Contains(t, query.SQL, "LIMIT 10")
 	assert.Contains(t, query.SQL, "OFFSET 20")
 }
 
 func TestQueryBuilder_Page(t *testing.T) {
-	builder := NewBuilder()
+	builder := storage.NewBuilder()
 	builder.Select("*").
 		From("users").
 		Page(3, 10) // Page 3 with 10 items per page
-	
+
 	query, err := builder.Build()
 	require.NoError(t, err)
-	
+
 	assert.Contains(t, query.SQL, "LIMIT 10")
 	assert.Contains(t, query.SQL, "OFFSET 20") // (3-1) * 10 = 20
 }
 
 func TestQueryBuilder_ComplexQuery(t *testing.T) {
-	builder := NewBuilder()
+	builder := storage.NewBuilder()
 	builder.Select("u.name", "u.email", "COUNT(o.id) as order_count").
 		From("users u").
-		LeftJoin("orders o", Equal("o.user_id", "u.id")).
-		Where(Equal("u.active", true)).
-		Where(GreaterThan("u.age", 18)).
+		LeftJoin("orders o", storage.Equal("o.user_id", "u.id")).
+		Where(storage.Equal("u.active", true)).
+		Where(storage.GreaterThan("u.age", 18)).
 		GroupBy("u.id", "u.name", "u.email").
 		OrderByDesc("order_count").
 		Limit(50)
-	
+
 	query, err := builder.Build()
 	require.NoError(t, err)
-	
+
 	expectedParts := []string{
 		"SELECT u.name, u.email, COUNT(o.id) as order_count",
 		"FROM users u",
@@ -158,11 +158,11 @@ func TestQueryBuilder_ComplexQuery(t *testing.T) {
 		"ORDER BY order_count DESC",
 		"LIMIT 50",
 	}
-	
+
 	for _, part := range expectedParts {
 		assert.Contains(t, query.SQL, part)
 	}
-	
+
 	assert.Equal(t, []interface{}{"u.id", true, 18}, query.Parameters)
 }
 
@@ -177,55 +177,55 @@ func TestConditionHelpers(t *testing.T) {
 	}{
 		{
 			name:      "Equal",
-			condition: Equal("id", 1),
+			condition: storage.Equal("id", 1),
 			field:     "id",
 			operator:  storage.OperatorEqual,
 			value:     1,
 		},
 		{
 			name:      "NotEqual",
-			condition: NotEqual("status", "deleted"),
+			condition: storage.NotEqual("status", "deleted"),
 			field:     "status",
 			operator:  storage.OperatorNotEqual,
 			value:     "deleted",
 		},
 		{
 			name:      "GreaterThan",
-			condition: GreaterThan("age", 18),
+			condition: storage.GreaterThan("age", 18),
 			field:     "age",
 			operator:  storage.OperatorGreaterThan,
 			value:     18,
 		},
 		{
 			name:      "LessThan",
-			condition: LessThan("price", 100.0),
+			condition: storage.LessThan("price", 100.0),
 			field:     "price",
 			operator:  storage.OperatorLessThan,
 			value:     100.0,
 		},
 		{
 			name:      "In",
-			condition: In("status", "active", "pending", "completed"),
+			condition: storage.In("status", "active", "pending", "completed"),
 			field:     "status",
 			operator:  storage.OperatorIn,
 			values:    []interface{}{"active", "pending", "completed"},
 		},
 		{
 			name:      "Like",
-			condition: Like("name", "%john%"),
+			condition: storage.Like("name", "%john%"),
 			field:     "name",
 			operator:  storage.OperatorLike,
 			value:     "%john%",
 		},
 		{
 			name:      "IsNull",
-			condition: IsNull("deleted_at"),
+			condition: storage.IsNull("deleted_at"),
 			field:     "deleted_at",
 			operator:  storage.OperatorIsNull,
 		},
 		{
 			name:      "IsNotNull",
-			condition: IsNotNull("email"),
+			condition: storage.IsNotNull("email"),
 			field:     "email",
 			operator:  storage.OperatorIsNotNull,
 		},
@@ -246,14 +246,14 @@ func TestConditionHelpers(t *testing.T) {
 }
 
 func TestCommandBuilder_Insert(t *testing.T) {
-	cmd := Insert("users").
+	cmd := storage.Insert("users").
 		Set("name", "John Doe").
 		Set("email", "john@example.com").
 		Set("age", 30)
-	
+
 	command, err := cmd.Build()
 	require.NoError(t, err)
-	
+
 	assert.Equal(t, storage.CommandTypeInsert, command.Type)
 	assert.Contains(t, command.SQL, "INSERT INTO users")
 	assert.Contains(t, command.SQL, "name")
@@ -267,14 +267,14 @@ func TestCommandBuilder_Insert(t *testing.T) {
 }
 
 func TestCommandBuilder_Update(t *testing.T) {
-	cmd := Update("users").
+	cmd := storage.Update("users").
 		Set("name", "Jane Doe").
 		Set("age", 25).
-		Where(Equal("id", 1))
-	
+		Where(storage.Equal("id", 1))
+
 	command, err := cmd.Build()
 	require.NoError(t, err)
-	
+
 	assert.Equal(t, storage.CommandTypeUpdate, command.Type)
 	assert.Contains(t, command.SQL, "UPDATE users SET")
 	assert.Contains(t, command.SQL, "name = ?")
@@ -284,13 +284,13 @@ func TestCommandBuilder_Update(t *testing.T) {
 }
 
 func TestCommandBuilder_Delete(t *testing.T) {
-	cmd := Delete("users").
-		Where(Equal("active", false)).
-		Where(LessThan("last_login", "2023-01-01"))
-	
+	cmd := storage.Delete("users").
+		Where(storage.Equal("active", false)).
+		Where(storage.LessThan("last_login", "2023-01-01"))
+
 	command, err := cmd.Build()
 	require.NoError(t, err)
-	
+
 	assert.Equal(t, storage.CommandTypeDelete, command.Type)
 	assert.Contains(t, command.SQL, "DELETE FROM users")
 	assert.Contains(t, command.SQL, "WHERE active = ? AND last_login < ?")
@@ -303,16 +303,16 @@ func TestCommandBuilder_Values(t *testing.T) {
 		"email": "alice@example.com",
 		"age":   28,
 	}
-	
-	cmd := Insert("users").Values(values)
-	
+
+	cmd := storage.Insert("users").Values(values)
+
 	command, err := cmd.Build()
 	require.NoError(t, err)
-	
+
 	assert.Equal(t, storage.CommandTypeInsert, command.Type)
 	assert.Contains(t, command.SQL, "INSERT INTO users")
 	assert.Len(t, command.Parameters, 3)
-	
+
 	// Check that all values are present (order may vary due to map iteration)
 	for _, param := range command.Parameters {
 		assert.Contains(t, []interface{}{"Alice Smith", "alice@example.com", 28}, param)
@@ -322,41 +322,41 @@ func TestCommandBuilder_Values(t *testing.T) {
 func TestCommandBuilder_Errors(t *testing.T) {
 	tests := []struct {
 		name    string
-		builder func() *CommandBuilder
+		builder func() *storage.CommandBuilder
 		wantErr bool
 	}{
 		{
 			name: "Insert without table",
-			builder: func() *CommandBuilder {
-				return NewCommandBuilder().Set("name", "test")
+			builder: func() *storage.CommandBuilder {
+				return storage.NewCommandBuilder().Set("name", "test")
 			},
 			wantErr: true,
 		},
 		{
 			name: "Insert without values",
-			builder: func() *CommandBuilder {
-				return Insert("users")
+			builder: func() *storage.CommandBuilder {
+				return storage.Insert("users")
 			},
 			wantErr: true,
 		},
 		{
 			name: "Update without table",
-			builder: func() *CommandBuilder {
-				return NewCommandBuilder().Set("name", "test")
+			builder: func() *storage.CommandBuilder {
+				return storage.NewCommandBuilder().Set("name", "test")
 			},
 			wantErr: true,
 		},
 		{
 			name: "Update without values",
-			builder: func() *CommandBuilder {
-				return Update("users").Where(Equal("id", 1))
+			builder: func() *storage.CommandBuilder {
+				return storage.Update("users").Where(storage.Equal("id", 1))
 			},
 			wantErr: true,
 		},
 		{
 			name: "Delete without table",
-			builder: func() *CommandBuilder {
-				return NewCommandBuilder().Where(Equal("id", 1))
+			builder: func() *storage.CommandBuilder {
+				return storage.NewCommandBuilder().Where(storage.Equal("id", 1))
 			},
 			wantErr: true,
 		},

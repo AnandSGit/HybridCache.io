@@ -13,9 +13,7 @@ import (
 	"github.com/stretchr/testify/require"
 	"github.com/stretchr/testify/suite"
 
-	"github.com/HybridCache.io/storage/pkg/adapters/postgres"
-	"github.com/HybridCache.io/storage/pkg/query"
-	"github.com/HybridCache.io/storage/pkg/storage"
+	"github.com/AnandSGit/HybridCache.io/pkg/storage"
 )
 
 type PostgreSQLIntegrationSuite struct {
@@ -32,16 +30,16 @@ func (suite *PostgreSQLIntegrationSuite) SetupSuite() {
 	}
 
 	// Create adapter and connect
-	suite.adapter = postgres.NewAdapter()
+	suite.adapter = storage.NewPostgreSQLAdapter()
 	config, err := suite.adapter.ParseDSN(dsn)
 	require.NoError(suite.T(), err)
 
 	// Configure for testing
-	config.MaxOpenConns = 10
-	config.MaxIdleConns = 5
-	config.ConnMaxLifetime = 1 * time.Hour
+	domain.config.MaxOpenConns = 10
+	domain.config.MaxIdleConns = 5
+	domain.config.ConnMaxLifetime = 1 * time.Hour
 
-	suite.store, err = suite.adapter.Connect(context.Background(), config)
+	suite.store, err = suite.adapter.Connect(context.Background(), domain.config)
 	require.NoError(suite.T(), err)
 
 	// Test connection
@@ -60,12 +58,12 @@ func (suite *PostgreSQLIntegrationSuite) SetupTest() {
 	ctx := context.Background()
 	
 	// Delete test users
-	deleteCmd := query.Delete("users").
-		Where(query.Like("email", "%@test.example%"))
+	deleteCmd := domain.Delete("users").
+		Where(domain.Like("email", "%@test.example%"))
 	
-	command, err := deleteCmd.Build()
+	domain.command, err := deleteCmd.Build()
 	if err == nil {
-		suite.store.Execute(ctx, command)
+		suite.store.Execute(ctx, domain.command)
 	}
 }
 
@@ -73,29 +71,29 @@ func (suite *PostgreSQLIntegrationSuite) TestBasicCRUD() {
 	ctx := context.Background()
 
 	// Test INSERT
-	insertCmd := query.Insert("users").
+	insertCmd := domain.Insert("users").
 		Set("name", "Integration Test User").
 		Set("email", "integration@test.example").
 		Set("age", 30).
 		Set("active", true)
 
-	command, err := insertCmd.Build()
+	domain.command, err := insertCmd.Build()
 	require.NoError(suite.T(), err)
 
-	result, err := suite.store.Execute(ctx, command)
+	result, err := suite.store.Execute(ctx, domain.command)
 	require.NoError(suite.T(), err)
 	assert.Equal(suite.T(), int64(1), result.RowsAffected)
 
 	// Test SELECT
-	selectQuery := query.NewBuilder().
+	selectQuery := domain.NewBuilder().
 		Select("id", "name", "email", "age", "active").
 		From("users").
-		Where(query.Equal("email", "integration@test.example"))
+		Where(domain.Equal("email", "integration@test.example"))
 
-	queryObj, err := selectQuery.Build()
+	queryObj, err := selectdomain.Build()
 	require.NoError(suite.T(), err)
 
-	rows, err := suite.store.Query(ctx, queryObj)
+	rows, err := suite.store.domain.Query(ctx, queryObj)
 	require.NoError(suite.T(), err)
 	defer rows.Close()
 
@@ -115,9 +113,9 @@ func (suite *PostgreSQLIntegrationSuite) TestBasicCRUD() {
 	assert.True(suite.T(), active)
 
 	// Test UPDATE
-	updateCmd := query.Update("users").
+	updateCmd := domain.Update("users").
 		Set("age", 31).
-		Where(query.Equal("email", "integration@test.example"))
+		Where(domain.Equal("email", "integration@test.example"))
 
 	updateCommand, err := updateCmd.Build()
 	require.NoError(suite.T(), err)
@@ -135,8 +133,8 @@ func (suite *PostgreSQLIntegrationSuite) TestBasicCRUD() {
 	assert.Equal(suite.T(), 31, age)
 
 	// Test DELETE
-	deleteCmd := query.Delete("users").
-		Where(query.Equal("email", "integration@test.example"))
+	deleteCmd := domain.Delete("users").
+		Where(domain.Equal("email", "integration@test.example"))
 
 	deleteCommand, err := deleteCmd.Build()
 	require.NoError(suite.T(), err)
@@ -150,33 +148,33 @@ func (suite *PostgreSQLIntegrationSuite) TestTransactions() {
 	ctx := context.Background()
 
 	// Begin transaction
-	tx, err := suite.store.BeginTx(ctx, &storage.TxOptions{
-		Isolation: storage.IsolationLevelReadCommitted,
+	tx, err := suite.store.BeginTx(ctx, &domain.domain.TxOptions{
+		Isolation: domain.domain.IsolationLevelReadCommitted,
 		Timeout:   30 * time.Second,
 	})
 	require.NoError(suite.T(), err)
 
 	// Insert user within transaction
-	insertCmd := query.Insert("users").
+	insertCmd := domain.Insert("users").
 		Set("name", "Transaction Test User").
 		Set("email", "transaction@test.example").
 		Set("age", 25).
 		Set("active", true)
 
-	command, err := insertCmd.Build()
+	domain.command, err := insertCmd.Build()
 	require.NoError(suite.T(), err)
 
-	result, err := tx.Execute(ctx, command)
+	result, err := tx.Execute(ctx, domain.command)
 	require.NoError(suite.T(), err)
 	assert.Equal(suite.T(), int64(1), result.RowsAffected)
 
-	// Query within transaction
-	selectQuery := query.NewBuilder().
+	// domain.Query within transaction
+	selectQuery := domain.NewBuilder().
 		Select("COUNT(*)").
 		From("users").
-		Where(query.Equal("email", "transaction@test.example"))
+		Where(domain.Equal("email", "transaction@test.example"))
 
-	queryObj, err := selectQuery.Build()
+	queryObj, err := selectdomain.Build()
 	require.NoError(suite.T(), err)
 
 	row, err := tx.QueryOne(ctx, queryObj)
@@ -204,29 +202,29 @@ func (suite *PostgreSQLIntegrationSuite) TestBatchOperations() {
 	ctx := context.Background()
 
 	// Create batch operations
-	operations := []storage.Operation{
+	operations := []domain.domain.Operation{
 		{
-			Type: storage.OperationTypeCommand,
-			Command: storage.Command{
+			Type: domain.domain.OperationTypeCommand,
+			domain.Command: domain.domain.Command{
 				SQL:        "INSERT INTO users (name, email, age, active) VALUES ($1, $2, $3, $4)",
 				Parameters: []interface{}{"Batch User 1", "batch1@test.example", 25, true},
-				Type:       storage.CommandTypeInsert,
+				Type:       domain.domain.CommandTypeInsert,
 			},
 		},
 		{
-			Type: storage.OperationTypeCommand,
-			Command: storage.Command{
+			Type: domain.domain.OperationTypeCommand,
+			domain.Command: domain.domain.Command{
 				SQL:        "INSERT INTO users (name, email, age, active) VALUES ($1, $2, $3, $4)",
 				Parameters: []interface{}{"Batch User 2", "batch2@test.example", 26, true},
-				Type:       storage.CommandTypeInsert,
+				Type:       domain.domain.CommandTypeInsert,
 			},
 		},
 		{
-			Type: storage.OperationTypeQuery,
-			Query: storage.Query{
+			Type: domain.domain.OperationTypeQuery,
+			domain.Query: domain.domain.Query{
 				SQL:        "SELECT COUNT(*) FROM users WHERE email LIKE $1",
 				Parameters: []interface{}{"%@test.example"},
-				Type:       storage.QueryTypeSelect,
+				Type:       domain.domain.QueryTypeSelect,
 			},
 		},
 	}
@@ -238,33 +236,33 @@ func (suite *PostgreSQLIntegrationSuite) TestBatchOperations() {
 
 	// Check results
 	for i, result := range results[:2] {
-		assert.NoError(suite.T(), result.Error, "Operation %d should succeed", i)
-		if execResult, ok := result.Result.(storage.ExecuteResult); ok {
+		assert.NoError(suite.T(), result.Error, "domain.Operation %d should succeed", i)
+		if execResult, ok := result.Result.(domain.domain.ExecuteResult); ok {
 			assert.Equal(suite.T(), int64(1), execResult.RowsAffected)
 		}
 	}
 
-	// Check query result
+	// Check domain.query result
 	assert.NoError(suite.T(), results[2].Error)
 }
 
 func (suite *PostgreSQLIntegrationSuite) TestComplexQueries() {
 	ctx := context.Background()
 
-	// Test JOIN query
-	joinQuery := query.NewBuilder().
+	// Test JOIN domain.query
+	joinQuery := domain.NewBuilder().
 		Select("u.name", "u.email", "COUNT(o.id) as order_count").
 		From("users u").
-		LeftJoin("orders o", query.Equal("o.user_id", "u.id")).
-		Where(query.Equal("u.active", true)).
+		LeftJoin("orders o", domain.Equal("o.user_id", "u.id")).
+		Where(domain.Equal("u.active", true)).
 		GroupBy("u.id", "u.name", "u.email").
-		OrderBy("order_count", storage.SortDirectionDesc).
+		OrderBy("order_count", domain.SortDirectionDesc).
 		Limit(5)
 
-	queryObj, err := joinQuery.Build()
+	queryObj, err := joindomain.Build()
 	require.NoError(suite.T(), err)
 
-	result, err := suite.store.Query(ctx, queryObj)
+	result, err := suite.store.domain.Query(ctx, queryObj)
 	require.NoError(suite.T(), err)
 	defer result.Close()
 
@@ -317,13 +315,13 @@ func (suite *PostgreSQLIntegrationSuite) TestHealthAndInfo() {
 
 	// Test Health
 	health := suite.store.Health(ctx)
-	assert.Equal(suite.T(), storage.HealthStatusHealthy, health.Status)
+	assert.Equal(suite.T(), domain.HealthStatusHealthy, health.Status)
 	assert.NotEmpty(suite.T(), health.Message)
 
 	// Test Info
 	info := suite.store.Info()
 	assert.Equal(suite.T(), "postgresql", info.Name)
-	assert.Equal(suite.T(), storage.DatabaseTypePostgreSQL, info.DatabaseType)
+	assert.Equal(suite.T(), domain.domain.DatabaseTypePostgreSQL, info.DatabaseType)
 	assert.NotEmpty(suite.T(), info.Features)
 	assert.Contains(suite.T(), info.Features, "transactions")
 	assert.Contains(suite.T(), info.Features, "joins")

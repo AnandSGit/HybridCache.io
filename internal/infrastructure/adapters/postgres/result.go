@@ -4,11 +4,11 @@ import (
 	"fmt"
 	"reflect"
 
-	"github.com/HybridCache.io/storage/pkg/storage"
+	"github.com/AnandSGit/HybridCache.io/internal/domain"
 	"github.com/jackc/pgx/v5"
 )
 
-// PostgreSQLResult implements the storage.Result interface for PostgreSQL
+// PostgreSQLResult implements the domain.Result interface for PostgreSQL
 type PostgreSQLResult struct {
 	rows pgx.Rows
 	err  error
@@ -33,7 +33,7 @@ func (r *PostgreSQLResult) Close() error {
 // Scan scans the current row into the provided destinations
 func (r *PostgreSQLResult) Scan(dest ...interface{}) error {
 	if r.rows == nil {
-		return storage.NewDataError("NO_ROWS", "no rows available")
+		return domain.NewDataError("NO_ROWS", "no rows available")
 	}
 	return r.rows.Scan(dest...)
 }
@@ -41,18 +41,18 @@ func (r *PostgreSQLResult) Scan(dest ...interface{}) error {
 // ScanRow scans the current row into a struct
 func (r *PostgreSQLResult) ScanRow(dest interface{}) error {
 	if r.rows == nil {
-		return storage.NewDataError("NO_ROWS", "no rows available")
+		return domain.NewDataError("NO_ROWS", "no rows available")
 	}
 
 	// Use reflection to scan into struct fields
 	destValue := reflect.ValueOf(dest)
 	if destValue.Kind() != reflect.Ptr {
-		return storage.NewDataError("INVALID_DESTINATION", "destination must be a pointer")
+		return domain.NewDataError("INVALID_DESTINATION", "destination must be a pointer")
 	}
 
 	destValue = destValue.Elem()
 	if destValue.Kind() != reflect.Struct {
-		return storage.NewDataError("INVALID_DESTINATION", "destination must be a pointer to struct")
+		return domain.NewDataError("INVALID_DESTINATION", "destination must be a pointer to struct")
 	}
 
 	// Get field descriptions
@@ -67,7 +67,7 @@ func (r *PostgreSQLResult) ScanRow(dest interface{}) error {
 
 	// Scan the row
 	if err := r.rows.Scan(valuePtrs...); err != nil {
-		return storage.NewDataError("SCAN_FAILED", err.Error()).WithCause(err)
+		return domain.NewDataError("SCAN_FAILED", err.Error()).WithCause(err)
 	}
 
 	// Map values to struct fields
@@ -89,7 +89,7 @@ func (r *PostgreSQLResult) ScanRow(dest interface{}) error {
 			if dbTag == fieldName || (dbTag == "" && field.Name == fieldName) {
 				if values[i] != nil {
 					if err := setFieldValue(structField, values[i]); err != nil {
-						return storage.NewDataError("FIELD_MAPPING_FAILED", err.Error()).WithCause(err)
+						return domain.NewDataError("FIELD_MAPPING_FAILED", err.Error()).WithCause(err)
 					}
 				}
 				break
@@ -103,7 +103,7 @@ func (r *PostgreSQLResult) ScanRow(dest interface{}) error {
 // Columns returns the column names
 func (r *PostgreSQLResult) Columns() ([]string, error) {
 	if r.rows == nil {
-		return nil, storage.NewDataError("NO_ROWS", "no rows available")
+		return nil, domain.NewDataError("NO_ROWS", "no rows available")
 	}
 
 	fieldDescriptions := r.rows.FieldDescriptions()
@@ -115,16 +115,16 @@ func (r *PostgreSQLResult) Columns() ([]string, error) {
 }
 
 // ColumnTypes returns the column types
-func (r *PostgreSQLResult) ColumnTypes() ([]storage.ColumnType, error) {
+func (r *PostgreSQLResult) ColumnTypes() ([]domain.ColumnType, error) {
 	if r.rows == nil {
-		return nil, storage.NewDataError("NO_ROWS", "no rows available")
+		return nil, domain.NewDataError("NO_ROWS", "no rows available")
 	}
 
 	fieldDescriptions := r.rows.FieldDescriptions()
-	columnTypes := make([]storage.ColumnType, len(fieldDescriptions))
+	columnTypes := make([]domain.ColumnType, len(fieldDescriptions))
 
 	for i, desc := range fieldDescriptions {
-		columnTypes[i] = storage.ColumnType{
+		columnTypes[i] = domain.ColumnType{
 			Name:         string(desc.Name),
 			DatabaseType: fmt.Sprintf("oid:%d", desc.DataTypeOID),
 			DataType:     mapOIDToDataType(desc.DataTypeOID),
@@ -137,12 +137,12 @@ func (r *PostgreSQLResult) ColumnTypes() ([]storage.ColumnType, error) {
 
 // RowsAffected returns the number of rows affected (not applicable for SELECT)
 func (r *PostgreSQLResult) RowsAffected() (int64, error) {
-	return 0, storage.NewDataError("NOT_APPLICABLE", "rows affected not applicable for query results")
+	return 0, domain.NewDataError("NOT_APPLICABLE", "rows affected not applicable for query results")
 }
 
 // LastInsertID returns the last insert ID (not supported by PostgreSQL)
 func (r *PostgreSQLResult) LastInsertID() (int64, error) {
-	return 0, storage.NewDataError("NOT_SUPPORTED", "last insert ID not supported by PostgreSQL")
+	return 0, domain.NewDataError("NOT_SUPPORTED", "last insert ID not supported by PostgreSQL")
 }
 
 // Err returns any error that occurred during iteration
@@ -153,7 +153,7 @@ func (r *PostgreSQLResult) Err() error {
 	return r.err
 }
 
-// PostgreSQLRow implements the storage.Row interface for PostgreSQL
+// PostgreSQLRow implements the domain.Row interface for PostgreSQL
 type PostgreSQLRow struct {
 	row pgx.Row
 	err error
@@ -162,7 +162,7 @@ type PostgreSQLRow struct {
 // Scan scans the row into the provided destinations
 func (r *PostgreSQLRow) Scan(dest ...interface{}) error {
 	if r.row == nil {
-		return storage.NewDataError("NO_ROW", "no row available")
+		return domain.NewDataError("NO_ROW", "no row available")
 	}
 	return r.row.Scan(dest...)
 }
@@ -170,19 +170,19 @@ func (r *PostgreSQLRow) Scan(dest ...interface{}) error {
 // ScanRow scans the row into a struct
 func (r *PostgreSQLRow) ScanRow(dest interface{}) error {
 	if r.row == nil {
-		return storage.NewDataError("NO_ROW", "no row available")
+		return domain.NewDataError("NO_ROW", "no row available")
 	}
 
 	// For single row, we need to use a different approach
 	// This is a simplified implementation - in practice, you'd want more sophisticated mapping
 	destValue := reflect.ValueOf(dest)
 	if destValue.Kind() != reflect.Ptr {
-		return storage.NewDataError("INVALID_DESTINATION", "destination must be a pointer")
+		return domain.NewDataError("INVALID_DESTINATION", "destination must be a pointer")
 	}
 
 	destValue = destValue.Elem()
 	if destValue.Kind() != reflect.Struct {
-		return storage.NewDataError("INVALID_DESTINATION", "destination must be a pointer to struct")
+		return domain.NewDataError("INVALID_DESTINATION", "destination must be a pointer to struct")
 	}
 
 	// For simplicity, we'll scan into the first field
@@ -192,10 +192,10 @@ func (r *PostgreSQLRow) ScanRow(dest interface{}) error {
 		if firstField.CanSet() {
 			var value interface{}
 			if err := r.row.Scan(&value); err != nil {
-				return storage.NewDataError("SCAN_FAILED", err.Error()).WithCause(err)
+				return domain.NewDataError("SCAN_FAILED", err.Error()).WithCause(err)
 			}
 			if err := setFieldValue(firstField, value); err != nil {
-				return storage.NewDataError("FIELD_MAPPING_FAILED", err.Error()).WithCause(err)
+				return domain.NewDataError("FIELD_MAPPING_FAILED", err.Error()).WithCause(err)
 			}
 		}
 	}
@@ -209,31 +209,31 @@ func (r *PostgreSQLRow) Err() error {
 }
 
 // Helper functions
-func mapOIDToDataType(oid uint32) storage.DataType {
+func mapOIDToDataType(oid uint32) domain.DataType {
 	// This is a simplified mapping - in practice, you'd want a complete OID to DataType mapping
 	switch oid {
 	case 23: // INT4
-		return storage.DataTypeInteger
+		return domain.DataTypeInteger
 	case 25: // TEXT
-		return storage.DataTypeString
+		return domain.DataTypeString
 	case 16: // BOOL
-		return storage.DataTypeBoolean
+		return domain.DataTypeBoolean
 	case 1114: // TIMESTAMP
-		return storage.DataTypeDateTime
+		return domain.DataTypeDateTime
 	case 1082: // DATE
-		return storage.DataTypeDate
+		return domain.DataTypeDate
 	case 1083: // TIME
-		return storage.DataTypeTime
+		return domain.DataTypeTime
 	case 17: // BYTEA
-		return storage.DataTypeBinary
+		return domain.DataTypeBinary
 	case 114: // JSON
-		return storage.DataTypeJSON
+		return domain.DataTypeJSON
 	case 3802: // JSONB
-		return storage.DataTypeJSON
+		return domain.DataTypeJSON
 	case 2950: // UUID
-		return storage.DataTypeUUID
+		return domain.DataTypeUUID
 	default:
-		return storage.DataTypeString
+		return domain.DataTypeString
 	}
 }
 
@@ -286,5 +286,5 @@ func setFieldValue(field reflect.Value, value interface{}) error {
 		}
 	}
 
-	return storage.NewDataError("TYPE_CONVERSION_FAILED", "cannot convert value to field type")
+	return domain.NewDataError("TYPE_CONVERSION_FAILED", "cannot convert value to field type")
 }

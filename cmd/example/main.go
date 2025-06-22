@@ -8,9 +8,7 @@ import (
 	"os"
 	"time"
 
-	"github.com/HybridCache.io/storage/pkg/adapters/postgres"
-	"github.com/HybridCache.io/storage/pkg/query"
-	"github.com/HybridCache.io/storage/pkg/storage"
+	"github.com/AnandSGit/HybridCache.io/pkg/storage"
 )
 
 // User represents a user in our system
@@ -43,7 +41,7 @@ func main() {
 	}
 
 	// Create adapter and connect
-	adapter := postgres.NewAdapter()
+	adapter := storage.NewPostgreSQLAdapter()
 	config, err := adapter.ParseDSN(dsn)
 	if err != nil {
 		log.Fatalf("Failed to parse DSN: %v", err)
@@ -85,7 +83,7 @@ func main() {
 
 	// 1. CREATE - Insert a new user
 	fmt.Println("\n1. Creating a new user...")
-	insertCmd := query.Insert("users").
+	insertCmd := storage.Insert("users").
 		Set("name", "Alice Johnson").
 		Set("email", "alice.johnson@example.com").
 		Set("age", 29).
@@ -105,10 +103,10 @@ func main() {
 
 	// 2. READ - Query users
 	fmt.Println("\n2. Reading users...")
-	selectQuery := query.NewBuilder().
+	selectQuery := storage.NewBuilder().
 		Select("id", "name", "email", "age", "active").
 		From("users").
-		Where(query.Equal("active", true)).
+		Where(storage.Equal("active", true)).
 		OrderBy("name", storage.SortDirectionAsc).
 		Limit(5)
 
@@ -135,9 +133,9 @@ func main() {
 
 	// 3. UPDATE - Update a user
 	fmt.Println("\n3. Updating user...")
-	updateCmd := query.Update("users").
+	updateCmd := storage.Update("users").
 		Set("age", 30).
-		Where(query.Equal("email", "alice.johnson@example.com"))
+		Where(storage.Equal("email", "alice.johnson@example.com"))
 
 	updateCommand, err := updateCmd.Build()
 	if err != nil {
@@ -152,11 +150,11 @@ func main() {
 
 	// 4. Complex Query with JOIN
 	fmt.Println("\n4. Complex query with JOIN...")
-	complexQuery := query.NewBuilder().
+	complexQuery := storage.NewBuilder().
 		Select("u.name", "u.email", "COUNT(o.id) as order_count").
 		From("users u").
-		LeftJoin("orders o", query.Equal("o.user_id", "u.id")).
-		Where(query.Equal("u.active", true)).
+		LeftJoin("orders o", storage.Equal("o.user_id", "u.id")).
+		Where(storage.Equal("u.active", true)).
 		GroupBy("u.id", "u.name", "u.email").
 		OrderBy("order_count", storage.SortDirectionDesc).
 		Limit(10)
@@ -223,7 +221,7 @@ func demonstrateTransaction(ctx context.Context, store storage.Storage) error {
 	defer tx.Rollback() // Ensure rollback if not committed
 
 	// Insert a user within the transaction
-	insertCmd := query.Insert("users").
+	insertCmd := storage.Insert("users").
 		Set("name", "Transaction User").
 		Set("email", "tx.user@example.com").
 		Set("age", 25).
@@ -240,10 +238,10 @@ func demonstrateTransaction(ctx context.Context, store storage.Storage) error {
 	}
 
 	// Query within the transaction
-	selectQuery := query.NewBuilder().
+	selectQuery := storage.NewBuilder().
 		Select("COUNT(*)").
 		From("users").
-		Where(query.Equal("email", "tx.user@example.com"))
+		Where(storage.Equal("email", "tx.user@example.com"))
 
 	queryObj, err := selectQuery.Build()
 	if err != nil {

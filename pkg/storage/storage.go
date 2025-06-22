@@ -10,22 +10,17 @@ import (
 
 // Core interfaces
 type (
-	Storage          = domain.Storage
-	Adapter          = domain.Adapter
-	QueryBuilder     = domain.QueryBuilder
-	Transaction      = domain.Transaction
-	Result           = domain.Result
-	Row              = domain.Row
-	Connection       = domain.Connection
-	HealthChecker    = domain.HealthChecker
-	MetricsCollector = domain.MetricsCollector
-	Logger           = domain.Logger
-	CacheProvider    = domain.CacheProvider
+	Storage      = domain.Storage
+	Adapter      = domain.Adapter
+	QueryBuilder = domain.QueryBuilder
+	Transaction  = domain.Transaction
+	Result       = domain.Result
+	Row          = domain.Row
 )
 
 // Core types
 type (
-	DatabaseType        = domain.DatabaseType
+	DatabaseType       = domain.DatabaseType
 	DataType           = domain.DataType
 	Query              = domain.Query
 	Command            = domain.Command
@@ -75,27 +70,27 @@ const (
 	DatabaseTypeCassandra   = domain.DatabaseTypeCassandra
 
 	// Data types
-	DataTypeString    = domain.DataTypeString
-	DataTypeInt       = domain.DataTypeInt
-	DataTypeInt64     = domain.DataTypeInt64
-	DataTypeFloat64   = domain.DataTypeFloat64
-	DataTypeBool      = domain.DataTypeBool
-	DataTypeTime      = domain.DataTypeTime
-	DataTypeBytes     = domain.DataTypeBytes
-	DataTypeJSON      = domain.DataTypeJSON
-	DataTypeUUID      = domain.DataTypeUUID
-	DataTypeDecimal   = domain.DataTypeDecimal
-	DataTypeArray     = domain.DataTypeArray
-	DataTypeMap       = domain.DataTypeMap
-	DataTypeUnknown   = domain.DataTypeUnknown
+	DataTypeString   = domain.DataTypeString
+	DataTypeInteger  = domain.DataTypeInteger
+	DataTypeFloat    = domain.DataTypeFloat
+	DataTypeBoolean  = domain.DataTypeBoolean
+	DataTypeDateTime = domain.DataTypeDateTime
+	DataTypeDate     = domain.DataTypeDate
+	DataTypeTime     = domain.DataTypeTime
+	DataTypeBinary   = domain.DataTypeBinary
+	DataTypeJSON     = domain.DataTypeJSON
+	DataTypeUUID     = domain.DataTypeUUID
+	DataTypeDecimal  = domain.DataTypeDecimal
+	DataTypeArray    = domain.DataTypeArray
+	DataTypeMap      = domain.DataTypeMap
+	DataTypeText     = domain.DataTypeText
+	DataTypeUnknown  = domain.DataTypeUnknown
 
 	// Query types
 	QueryTypeSelect = domain.QueryTypeSelect
 	QueryTypeInsert = domain.QueryTypeInsert
 	QueryTypeUpdate = domain.QueryTypeUpdate
 	QueryTypeDelete = domain.QueryTypeDelete
-	QueryTypeCount  = domain.QueryTypeCount
-	QueryTypeExists = domain.QueryTypeExists
 
 	// Command types
 	CommandTypeInsert     = domain.CommandTypeInsert
@@ -157,10 +152,10 @@ const (
 	SchemaChangeTypeDropIndex    = domain.SchemaChangeTypeDropIndex
 
 	// Index types
-	IndexTypePrimary = domain.IndexTypePrimary
-	IndexTypeUnique  = domain.IndexTypeUnique
-	IndexTypeRegular = domain.IndexTypeRegular
-	IndexTypePartial = domain.IndexTypePartial
+	IndexTypeBTree = domain.IndexTypeBTree
+	IndexTypeHash  = domain.IndexTypeHash
+	IndexTypeGIN   = domain.IndexTypeGIN
+	IndexTypeGiST  = domain.IndexTypeGiST
 
 	// Health status types
 	HealthStatusHealthy   = domain.HealthStatusHealthy
@@ -179,26 +174,5 @@ const (
 	ErrorTypeUnknown     = domain.ErrorTypeUnknown
 )
 
-// Error types
-type (
-	StorageError     = domain.StorageError
-	ConnectionError  = domain.ConnectionError
-	QueryError       = domain.QueryError
-	TransactionError = domain.TransactionError
-	DataError        = domain.DataError
-	SchemaError      = domain.SchemaError
-	TimeoutError     = domain.TimeoutError
-	ValidationError  = domain.ValidationError
-)
-
-// Error constructors
-var (
-	NewStorageError     = domain.NewStorageError
-	NewConnectionError  = domain.NewConnectionError
-	NewQueryError       = domain.NewQueryError
-	NewTransactionError = domain.NewTransactionError
-	NewDataError        = domain.NewDataError
-	NewSchemaError      = domain.NewSchemaError
-	NewTimeoutError     = domain.NewTimeoutError
-	NewValidationError  = domain.NewValidationError
-)
+// Error types and constructors are re-exported from domain package
+// These will be available once the domain error types are properly defined

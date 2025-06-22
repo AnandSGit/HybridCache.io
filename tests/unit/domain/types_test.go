@@ -1,27 +1,28 @@
-package storage
+package domain
 
 import (
 	"testing"
 	"time"
 
+	"github.com/AnandSGit/HybridCache.io/internal/domain"
 	"github.com/stretchr/testify/assert"
 )
 
 func TestDatabaseType_String(t *testing.T) {
 	tests := []struct {
 		name     string
-		dbType   DatabaseType
+		dbType   domain.DatabaseType
 		expected string
 	}{
-		{"PostgreSQL", DatabaseTypePostgreSQL, "postgresql"},
-		{"MySQL", DatabaseTypeMySQL, "mysql"},
-		{"SQLite", DatabaseTypeSQLite, "sqlite"},
-		{"Redis", DatabaseTypeRedis, "redis"},
-		{"MongoDB", DatabaseTypeMongoDB, "mongodb"},
-		{"CockroachDB", DatabaseTypeCockroachDB, "cockroachdb"},
-		{"DynamoDB", DatabaseTypeDynamoDB, "dynamodb"},
-		{"Cassandra", DatabaseTypeCassandra, "cassandra"},
-		{"Unknown", DatabaseTypeUnknown, "unknown"},
+		{"PostgreSQL", domain.DatabaseTypePostgreSQL, "postgresql"},
+		{"MySQL", domain.DatabaseTypeMySQL, "mysql"},
+		{"SQLite", domain.DatabaseTypeSQLite, "sqlite"},
+		{"Redis", domain.DatabaseTypeRedis, "redis"},
+		{"MongoDB", domain.DatabaseTypeMongoDB, "mongodb"},
+		{"CockroachDB", domain.DatabaseTypeCockroachDB, "cockroachdb"},
+		{"DynamoDB", domain.DatabaseTypeDynamoDB, "dynamodb"},
+		{"Cassandra", domain.DatabaseTypeCassandra, "cassandra"},
+		{"Unknown", domain.DatabaseTypeUnknown, "unknown"},
 	}
 
 	for _, tt := range tests {
@@ -35,24 +36,24 @@ func TestDatabaseType_String(t *testing.T) {
 func TestDataType_String(t *testing.T) {
 	tests := []struct {
 		name     string
-		dataType DataType
+		dataType domain.DataType
 		expected string
 	}{
-		{"String", DataTypeString, "string"},
-		{"Integer", DataTypeInteger, "integer"},
-		{"Float", DataTypeFloat, "float"},
-		{"Boolean", DataTypeBoolean, "boolean"},
-		{"DateTime", DataTypeDateTime, "datetime"},
-		{"Date", DataTypeDate, "date"},
-		{"Time", DataTypeTime, "time"},
-		{"Binary", DataTypeBinary, "binary"},
-		{"JSON", DataTypeJSON, "json"},
-		{"UUID", DataTypeUUID, "uuid"},
-		{"Array", DataTypeArray, "array"},
-		{"Map", DataTypeMap, "map"},
-		{"Decimal", DataTypeDecimal, "decimal"},
-		{"Text", DataTypeText, "text"},
-		{"Unknown", DataTypeUnknown, "unknown"},
+		{"String", domain.DataTypeString, "string"},
+		{"Integer", domain.DataTypeInteger, "integer"},
+		{"Float", domain.DataTypeFloat, "float"},
+		{"Boolean", domain.DataTypeBoolean, "boolean"},
+		{"DateTime", domain.DataTypeDateTime, "datetime"},
+		{"Date", domain.DataTypeDate, "date"},
+		{"Time", domain.DataTypeTime, "time"},
+		{"Binary", domain.DataTypeBinary, "binary"},
+		{"JSON", domain.DataTypeJSON, "json"},
+		{"UUID", domain.DataTypeUUID, "uuid"},
+		{"Array", domain.DataTypeArray, "array"},
+		{"Map", domain.DataTypeMap, "map"},
+		{"Decimal", domain.DataTypeDecimal, "decimal"},
+		{"Text", domain.DataTypeText, "text"},
+		{"Unknown", domain.DataTypeUnknown, "unknown"},
 	}
 
 	for _, tt := range tests {
@@ -64,11 +65,11 @@ func TestDataType_String(t *testing.T) {
 }
 
 func TestQuery_Creation(t *testing.T) {
-	query := Query{
+	query := domain.Query{
 		SQL:        "SELECT * FROM users WHERE id = ?",
 		Parameters: []interface{}{1},
-		Type:       QueryTypeSelect,
-		Options: QueryOptions{
+		Type:       domain.QueryTypeSelect,
+		Options: domain.QueryOptions{
 			Timeout:  30 * time.Second,
 			CacheKey: "user:1",
 			CacheTTL: 5 * time.Minute,
@@ -78,7 +79,7 @@ func TestQuery_Creation(t *testing.T) {
 
 	assert.Equal(t, "SELECT * FROM users WHERE id = ?", query.SQL)
 	assert.Equal(t, []interface{}{1}, query.Parameters)
-	assert.Equal(t, QueryTypeSelect, query.Type)
+	assert.Equal(t, domain.QueryTypeSelect, query.Type)
 	assert.Equal(t, 30*time.Second, query.Options.Timeout)
 	assert.Equal(t, "user:1", query.Options.CacheKey)
 	assert.Equal(t, 5*time.Minute, query.Options.CacheTTL)
@@ -86,67 +87,67 @@ func TestQuery_Creation(t *testing.T) {
 }
 
 func TestCommand_Creation(t *testing.T) {
-	command := Command{
+	command := domain.Command{
 		SQL:        "INSERT INTO users (name, email) VALUES (?, ?)",
 		Parameters: []interface{}{"John Doe", "john@example.com"},
-		Type:       CommandTypeInsert,
-		Options: CommandOptions{
+		Type:       domain.CommandTypeInsert,
+		Options: domain.CommandOptions{
 			Timeout:     10 * time.Second,
 			ReturnID:    true,
 			ReturnCount: true,
-			OnConflict:  ConflictResolutionIgnore,
+			OnConflict:  domain.ConflictResolutionIgnore,
 		},
 	}
 
 	assert.Equal(t, "INSERT INTO users (name, email) VALUES (?, ?)", command.SQL)
 	assert.Equal(t, []interface{}{"John Doe", "john@example.com"}, command.Parameters)
-	assert.Equal(t, CommandTypeInsert, command.Type)
+	assert.Equal(t, domain.CommandTypeInsert, command.Type)
 	assert.Equal(t, 10*time.Second, command.Options.Timeout)
 	assert.True(t, command.Options.ReturnID)
 	assert.True(t, command.Options.ReturnCount)
-	assert.Equal(t, ConflictResolutionIgnore, command.Options.OnConflict)
+	assert.Equal(t, domain.ConflictResolutionIgnore, command.Options.OnConflict)
 }
 
 func TestCondition_Creation(t *testing.T) {
 	tests := []struct {
 		name      string
-		condition Condition
+		condition domain.Condition
 		field     string
-		operator  Operator
+		operator  domain.Operator
 		value     interface{}
 		values    []interface{}
 	}{
 		{
 			name: "Equal condition",
-			condition: Condition{
+			condition: domain.Condition{
 				Field:    "id",
-				Operator: OperatorEqual,
+				Operator: domain.OperatorEqual,
 				Value:    1,
 			},
 			field:    "id",
-			operator: OperatorEqual,
+			operator: domain.OperatorEqual,
 			value:    1,
 		},
 		{
 			name: "In condition",
-			condition: Condition{
+			condition: domain.Condition{
 				Field:    "status",
-				Operator: OperatorIn,
+				Operator: domain.OperatorIn,
 				Values:   []interface{}{"active", "pending"},
 			},
 			field:    "status",
-			operator: OperatorIn,
+			operator: domain.OperatorIn,
 			values:   []interface{}{"active", "pending"},
 		},
 		{
 			name: "Between condition",
-			condition: Condition{
+			condition: domain.Condition{
 				Field:    "age",
-				Operator: OperatorBetween,
+				Operator: domain.OperatorBetween,
 				Values:   []interface{}{18, 65},
 			},
 			field:    "age",
-			operator: OperatorBetween,
+			operator: domain.OperatorBetween,
 			values:   []interface{}{18, 65},
 		},
 	}
@@ -166,25 +167,25 @@ func TestCondition_Creation(t *testing.T) {
 }
 
 func TestTxOptions_Creation(t *testing.T) {
-	opts := TxOptions{
-		Isolation: IsolationLevelSerializable,
+	opts := domain.TxOptions{
+		Isolation: domain.IsolationLevelSerializable,
 		ReadOnly:  true,
 		Timeout:   30 * time.Second,
 	}
 
-	assert.Equal(t, IsolationLevelSerializable, opts.Isolation)
+	assert.Equal(t, domain.IsolationLevelSerializable, opts.Isolation)
 	assert.True(t, opts.ReadOnly)
 	assert.Equal(t, 30*time.Second, opts.Timeout)
 }
 
 func TestConfig_Creation(t *testing.T) {
-	config := Config{
-		Host:     "localhost",
-		Port:     5432,
-		Database: "testdb",
-		Username: "testuser",
-		Password: "testpass",
-		DSN:      "postgres://testuser:testpass@localhost:5432/testdb",
+	config := domain.Config{
+		Host:            "localhost",
+		Port:            5432,
+		Database:        "testdb",
+		Username:        "testuser",
+		Password:        "testpass",
+		DSN:             "postgres://testuser:testpass@localhost:5432/testdb",
 		MaxOpenConns:    25,
 		MaxIdleConns:    5,
 		ConnMaxLifetime: 1 * time.Hour,
@@ -201,6 +202,7 @@ func TestConfig_Creation(t *testing.T) {
 	assert.Equal(t, "testdb", config.Database)
 	assert.Equal(t, "testuser", config.Username)
 	assert.Equal(t, "testpass", config.Password)
+	assert.Equal(t, "postgres://testuser:testpass@localhost:5432/testdb", config.DSN)
 	assert.Equal(t, 25, config.MaxOpenConns)
 	assert.Equal(t, 5, config.MaxIdleConns)
 	assert.Equal(t, 1*time.Hour, config.ConnMaxLifetime)
@@ -213,12 +215,12 @@ func TestConfig_Creation(t *testing.T) {
 }
 
 func TestStorageInfo_Creation(t *testing.T) {
-	info := StorageInfo{
+	info := domain.StorageInfo{
 		Name:         "PostgreSQL",
 		Version:      "1.0.0",
-		DatabaseType: DatabaseTypePostgreSQL,
+		DatabaseType: domain.DatabaseTypePostgreSQL,
 		Features:     []string{"transactions", "joins", "schema"},
-		Limits: StorageLimits{
+		Limits: domain.StorageLimits{
 			MaxConnections:    100,
 			MaxQuerySize:      1024 * 1024,
 			MaxTransactionAge: 24 * time.Hour,
@@ -228,7 +230,7 @@ func TestStorageInfo_Creation(t *testing.T) {
 
 	assert.Equal(t, "PostgreSQL", info.Name)
 	assert.Equal(t, "1.0.0", info.Version)
-	assert.Equal(t, DatabaseTypePostgreSQL, info.DatabaseType)
+	assert.Equal(t, domain.DatabaseTypePostgreSQL, info.DatabaseType)
 	assert.Contains(t, info.Features, "transactions")
 	assert.Contains(t, info.Features, "joins")
 	assert.Contains(t, info.Features, "schema")
@@ -240,8 +242,8 @@ func TestStorageInfo_Creation(t *testing.T) {
 
 func TestHealthStatus_Creation(t *testing.T) {
 	now := time.Now()
-	status := HealthStatus{
-		Status:    HealthStatusHealthy,
+	status := domain.HealthStatus{
+		Status:    domain.HealthStatusHealthy,
 		Message:   "All systems operational",
 		Timestamp: now,
 		Details: map[string]interface{}{
@@ -250,7 +252,7 @@ func TestHealthStatus_Creation(t *testing.T) {
 		},
 	}
 
-	assert.Equal(t, HealthStatusHealthy, status.Status)
+	assert.Equal(t, domain.HealthStatusHealthy, status.Status)
 	assert.Equal(t, "All systems operational", status.Message)
 	assert.Equal(t, now, status.Timestamp)
 	assert.Equal(t, 10, status.Details["connections"])
@@ -258,35 +260,35 @@ func TestHealthStatus_Creation(t *testing.T) {
 }
 
 func TestTableSchema_Creation(t *testing.T) {
-	schema := TableSchema{
+	schema := domain.TableSchema{
 		Name: "users",
-		Columns: []ColumnDefinition{
+		Columns: []domain.ColumnDefinition{
 			{
-				Name:         "id",
-				DataType:     DataTypeInteger,
-				Nullable:     false,
-				PrimaryKey:   true,
+				Name:          "id",
+				DataType:      domain.DataTypeInteger,
+				Nullable:      false,
+				PrimaryKey:    true,
 				AutoIncrement: true,
 			},
 			{
-				Name:         "name",
-				DataType:     DataTypeString,
-				Length:       100,
-				Nullable:     false,
+				Name:     "name",
+				DataType: domain.DataTypeString,
+				Length:   100,
+				Nullable: false,
 			},
 			{
-				Name:         "email",
-				DataType:     DataTypeString,
-				Length:       255,
-				Nullable:     false,
+				Name:     "email",
+				DataType: domain.DataTypeString,
+				Length:   255,
+				Nullable: false,
 			},
 		},
-		Indexes: []IndexDefinition{
+		Indexes: []domain.IndexDefinition{
 			{
 				Name:    "idx_users_email",
 				Columns: []string{"email"},
 				Unique:  true,
-				Type:    IndexTypeBTree,
+				Type:    domain.IndexTypeBTree,
 			},
 		},
 	}
@@ -294,19 +296,19 @@ func TestTableSchema_Creation(t *testing.T) {
 	assert.Equal(t, "users", schema.Name)
 	assert.Len(t, schema.Columns, 3)
 	assert.Equal(t, "id", schema.Columns[0].Name)
-	assert.Equal(t, DataTypeInteger, schema.Columns[0].DataType)
+	assert.Equal(t, domain.DataTypeInteger, schema.Columns[0].DataType)
 	assert.True(t, schema.Columns[0].PrimaryKey)
 	assert.True(t, schema.Columns[0].AutoIncrement)
 	assert.False(t, schema.Columns[0].Nullable)
-	
+
 	assert.Equal(t, "name", schema.Columns[1].Name)
-	assert.Equal(t, DataTypeString, schema.Columns[1].DataType)
+	assert.Equal(t, domain.DataTypeString, schema.Columns[1].DataType)
 	assert.Equal(t, int64(100), schema.Columns[1].Length)
 	assert.False(t, schema.Columns[1].Nullable)
-	
+
 	assert.Len(t, schema.Indexes, 1)
 	assert.Equal(t, "idx_users_email", schema.Indexes[0].Name)
 	assert.Equal(t, []string{"email"}, schema.Indexes[0].Columns)
 	assert.True(t, schema.Indexes[0].Unique)
-	assert.Equal(t, IndexTypeBTree, schema.Indexes[0].Type)
+	assert.Equal(t, domain.IndexTypeBTree, schema.Indexes[0].Type)
 }

@@ -7,9 +7,7 @@ import (
 	"log"
 	"time"
 
-	"github.com/HybridCache.io/storage/pkg/adapters/postgres"
-	"github.com/HybridCache.io/storage/pkg/query"
-	"github.com/HybridCache.io/storage/pkg/storage"
+	"github.com/AnandSGit/HybridCache.io/pkg/storage"
 )
 
 // User represents a user entity
@@ -26,7 +24,7 @@ func main() {
 	ctx := context.Background()
 
 	// Initialize PostgreSQL adapter
-	adapter := postgres.NewAdapter()
+	adapter := storage.NewPostgreSQLAdapter()
 	config := storage.Config{
 		Host:            "localhost",
 		Port:            5432,
@@ -68,7 +66,7 @@ func main() {
 		Age:    25,
 		Active: true,
 	}
-	
+
 	if err := createUser(ctx, store, newUser); err != nil {
 		log.Printf("Error creating user: %v", err)
 	} else {
@@ -102,10 +100,10 @@ func main() {
 
 // getActiveUsers demonstrates a simple SELECT query
 func getActiveUsers(ctx context.Context, store storage.Storage) ([]User, error) {
-	query := query.NewBuilder().
+	query := storage.NewBuilder().
 		Select("id", "name", "email", "age", "active", "created_at").
 		From("users").
-		Where(query.Equal("active", true)).
+		Where(storage.Equal("active", true)).
 		OrderBy("name", storage.SortDirectionAsc).
 		Limit(10)
 
@@ -138,7 +136,7 @@ func getActiveUsers(ctx context.Context, store storage.Storage) ([]User, error) 
 
 // createUser demonstrates an INSERT command
 func createUser(ctx context.Context, store storage.Storage, user User) error {
-	cmd := query.Insert("users").
+	cmd := storage.Insert("users").
 		Set("name", user.Name).
 		Set("email", user.Email).
 		Set("age", user.Age).
@@ -160,10 +158,10 @@ func createUser(ctx context.Context, store storage.Storage, user User) error {
 
 // updateUserAge demonstrates an UPDATE command
 func updateUserAge(ctx context.Context, store storage.Storage, email string, newAge int) error {
-	cmd := query.Update("users").
+	cmd := storage.Update("users").
 		Set("age", newAge).
 		Set("updated_at", time.Now()).
-		Where(query.Equal("email", email))
+		Where(storage.Equal("email", email))
 
 	command, err := cmd.Build()
 	if err != nil {
@@ -191,9 +189,9 @@ func transferUserStatus(ctx context.Context, store storage.Storage) error {
 	defer tx.Rollback()
 
 	// Deactivate one user
-	deactivateCmd := query.Update("users").
+	deactivateCmd := storage.Update("users").
 		Set("active", false).
-		Where(query.Equal("email", "bob.johnson@example.com"))
+		Where(storage.Equal("email", "bob.johnson@example.com"))
 
 	command1, err := deactivateCmd.Build()
 	if err != nil {
@@ -206,9 +204,9 @@ func transferUserStatus(ctx context.Context, store storage.Storage) error {
 	}
 
 	// Activate another user
-	activateCmd := query.Update("users").
+	activateCmd := storage.Update("users").
 		Set("active", true).
-		Where(query.Equal("email", "example@test.com"))
+		Where(storage.Equal("email", "example@test.com"))
 
 	command2, err := activateCmd.Build()
 	if err != nil {
@@ -220,7 +218,7 @@ func transferUserStatus(ctx context.Context, store storage.Storage) error {
 		return fmt.Errorf("failed to activate user: %w", err)
 	}
 
-	fmt.Printf("Deactivated %d users, activated %d users\n", 
+	fmt.Printf("Deactivated %d users, activated %d users\n",
 		result1.RowsAffected, result2.RowsAffected)
 
 	// Commit transaction
@@ -234,13 +232,13 @@ func transferUserStatus(ctx context.Context, store storage.Storage) error {
 // complexQueryExample demonstrates complex queries with joins
 func complexQueryExample(ctx context.Context, store storage.Storage) error {
 	// Query users with their order counts
-	query := query.NewBuilder().
+	query := storage.NewBuilder().
 		Select("u.name", "u.email", "COUNT(o.id) as order_count").
 		From("users u").
-		LeftJoin("orders o", query.Equal("o.user_id", "u.id")).
-		Where(query.Equal("u.active", true)).
+		LeftJoin("orders o", storage.Equal("o.user_id", "u.id")).
+		Where(storage.Equal("u.active", true)).
 		GroupBy("u.id", "u.name", "u.email").
-		Having(query.GreaterThan("COUNT(o.id)", 0)).
+		Having(storage.GreaterThan("COUNT(o.id)", 0)).
 		OrderBy("order_count", storage.SortDirectionDesc).
 		Limit(5)
 

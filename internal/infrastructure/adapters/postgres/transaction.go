@@ -5,11 +5,11 @@ import (
 	"fmt"
 	"sync"
 
+	"github.com/AnandSGit/HybridCache.io/internal/domain"
 	"github.com/jackc/pgx/v5"
-	"github.com/HybridCache.io/storage/pkg/storage"
 )
 
-// PostgreSQLTransaction implements the storage.Transaction interface for PostgreSQL
+// PostgreSQLTransaction implements the domain.Transaction interface for PostgreSQL
 type PostgreSQLTransaction struct {
 	tx      pgx.Tx
 	adapter *Adapter
@@ -19,144 +19,144 @@ type PostgreSQLTransaction struct {
 }
 
 // Query executes a query within the transaction
-func (t *PostgreSQLTransaction) Query(ctx context.Context, query storage.Query) (storage.Result, error) {
+func (t *PostgreSQLTransaction) Query(ctx context.Context, query domain.Query) (domain.Result, error) {
 	t.mu.RLock()
 	defer t.mu.RUnlock()
-	
+
 	if !t.active {
-		return nil, storage.NewTransactionError("TRANSACTION_CLOSED", "transaction is not active")
+		return nil, domain.NewTransactionError("TRANSACTION_CLOSED", "transaction is not active")
 	}
-	
+
 	sql, params, err := t.adapter.TranslateQuery(query)
 	if err != nil {
-		return nil, storage.NewQueryError("QUERY_TRANSLATION_FAILED", err.Error()).WithCause(err)
+		return nil, domain.NewQueryError("QUERY_TRANSLATION_FAILED", err.Error()).WithCause(err)
 	}
-	
+
 	rows, err := t.tx.Query(ctx, sql, params...)
 	if err != nil {
-		return nil, storage.NewQueryError("QUERY_EXECUTION_FAILED", err.Error()).WithCause(err)
+		return nil, domain.NewQueryError("QUERY_EXECUTION_FAILED", err.Error()).WithCause(err)
 	}
-	
+
 	return &PostgreSQLResult{rows: rows}, nil
 }
 
 // QueryOne executes a query and returns a single row within the transaction
-func (t *PostgreSQLTransaction) QueryOne(ctx context.Context, query storage.Query) (storage.Row, error) {
+func (t *PostgreSQLTransaction) QueryOne(ctx context.Context, query domain.Query) (domain.Row, error) {
 	t.mu.RLock()
 	defer t.mu.RUnlock()
-	
+
 	if !t.active {
-		return nil, storage.NewTransactionError("TRANSACTION_CLOSED", "transaction is not active")
+		return nil, domain.NewTransactionError("TRANSACTION_CLOSED", "transaction is not active")
 	}
-	
+
 	sql, params, err := t.adapter.TranslateQuery(query)
 	if err != nil {
-		return nil, storage.NewQueryError("QUERY_TRANSLATION_FAILED", err.Error()).WithCause(err)
+		return nil, domain.NewQueryError("QUERY_TRANSLATION_FAILED", err.Error()).WithCause(err)
 	}
-	
+
 	row := t.tx.QueryRow(ctx, sql, params...)
 	return &PostgreSQLRow{row: row}, nil
 }
 
 // Execute executes a command within the transaction
-func (t *PostgreSQLTransaction) Execute(ctx context.Context, command storage.Command) (storage.ExecuteResult, error) {
+func (t *PostgreSQLTransaction) Execute(ctx context.Context, command domain.Command) (domain.ExecuteResult, error) {
 	t.mu.RLock()
 	defer t.mu.RUnlock()
-	
+
 	if !t.active {
-		return storage.ExecuteResult{}, storage.NewTransactionError("TRANSACTION_CLOSED", "transaction is not active")
+		return domain.ExecuteResult{}, domain.NewTransactionError("TRANSACTION_CLOSED", "transaction is not active")
 	}
-	
+
 	sql, params, err := t.adapter.TranslateCommand(command)
 	if err != nil {
-		return storage.ExecuteResult{}, storage.NewQueryError("COMMAND_TRANSLATION_FAILED", err.Error()).WithCause(err)
+		return domain.ExecuteResult{}, domain.NewQueryError("COMMAND_TRANSLATION_FAILED", err.Error()).WithCause(err)
 	}
-	
+
 	result, err := t.tx.Exec(ctx, sql, params...)
 	if err != nil {
-		return storage.ExecuteResult{}, storage.NewQueryError("COMMAND_EXECUTION_FAILED", err.Error()).WithCause(err)
+		return domain.ExecuteResult{}, domain.NewQueryError("COMMAND_EXECUTION_FAILED", err.Error()).WithCause(err)
 	}
-	
-	return storage.ExecuteResult{
+
+	return domain.ExecuteResult{
 		RowsAffected: result.RowsAffected(),
 		LastInsertID: 0, // PostgreSQL doesn't support LastInsertID
 	}, nil
 }
 
 // Batch executes multiple operations within the transaction
-func (t *PostgreSQLTransaction) Batch(ctx context.Context, operations []storage.Operation) ([]storage.OperationResult, error) {
+func (t *PostgreSQLTransaction) Batch(ctx context.Context, operations []domain.Operation) ([]domain.OperationResult, error) {
 	t.mu.RLock()
 	defer t.mu.RUnlock()
-	
+
 	if !t.active {
-		return nil, storage.NewTransactionError("TRANSACTION_CLOSED", "transaction is not active")
+		return nil, domain.NewTransactionError("TRANSACTION_CLOSED", "transaction is not active")
 	}
-	
-	results := make([]storage.OperationResult, len(operations))
-	
+
+	results := make([]domain.OperationResult, len(operations))
+
 	batch := &pgx.Batch{}
-	
+
 	// Add all operations to the batch
 	for i, op := range operations {
 		switch op.Type {
-		case storage.OperationTypeQuery:
+		case domain.OperationTypeQuery:
 			sql, params, err := t.adapter.TranslateQuery(op.Query)
 			if err != nil {
-				results[i] = storage.OperationResult{
+				results[i] = domain.OperationResult{
 					Index: i,
-					Error: storage.NewQueryError("QUERY_TRANSLATION_FAILED", err.Error()).WithCause(err),
+					Error: domain.NewQueryError("QUERY_TRANSLATION_FAILED", err.Error()).WithCause(err),
 				}
 				continue
 			}
 			batch.Queue(sql, params...)
-		case storage.OperationTypeCommand:
+		case domain.OperationTypeCommand:
 			sql, params, err := t.adapter.TranslateCommand(op.Command)
 			if err != nil {
-				results[i] = storage.OperationResult{
+				results[i] = domain.OperationResult{
 					Index: i,
-					Error: storage.NewQueryError("COMMAND_TRANSLATION_FAILED", err.Error()).WithCause(err),
+					Error: domain.NewQueryError("COMMAND_TRANSLATION_FAILED", err.Error()).WithCause(err),
 				}
 				continue
 			}
 			batch.Queue(sql, params...)
 		}
 	}
-	
+
 	// Execute the batch
 	batchResults := t.tx.SendBatch(ctx, batch)
 	defer batchResults.Close()
-	
+
 	// Process results
 	for i, op := range operations {
 		if results[i].Error != nil {
 			continue // Skip operations that failed translation
 		}
-		
+
 		switch op.Type {
-		case storage.OperationTypeQuery:
+		case domain.OperationTypeQuery:
 			rows, err := batchResults.Query()
 			if err != nil {
-				results[i] = storage.OperationResult{
+				results[i] = domain.OperationResult{
 					Index: i,
-					Error: storage.NewQueryError("BATCH_QUERY_FAILED", err.Error()).WithCause(err),
+					Error: domain.NewQueryError("BATCH_QUERY_FAILED", err.Error()).WithCause(err),
 				}
 			} else {
-				results[i] = storage.OperationResult{
+				results[i] = domain.OperationResult{
 					Index:  i,
 					Result: &PostgreSQLResult{rows: rows},
 				}
 			}
-		case storage.OperationTypeCommand:
+		case domain.OperationTypeCommand:
 			cmdTag, err := batchResults.Exec()
 			if err != nil {
-				results[i] = storage.OperationResult{
+				results[i] = domain.OperationResult{
 					Index: i,
-					Error: storage.NewQueryError("BATCH_COMMAND_FAILED", err.Error()).WithCause(err),
+					Error: domain.NewQueryError("BATCH_COMMAND_FAILED", err.Error()).WithCause(err),
 				}
 			} else {
-				results[i] = storage.OperationResult{
+				results[i] = domain.OperationResult{
 					Index: i,
-					Result: storage.ExecuteResult{
+					Result: domain.ExecuteResult{
 						RowsAffected: cmdTag.RowsAffected(),
 						LastInsertID: 0,
 					},
@@ -164,7 +164,7 @@ func (t *PostgreSQLTransaction) Batch(ctx context.Context, operations []storage.
 			}
 		}
 	}
-	
+
 	return results, nil
 }
 
@@ -172,16 +172,16 @@ func (t *PostgreSQLTransaction) Batch(ctx context.Context, operations []storage.
 func (t *PostgreSQLTransaction) Commit() error {
 	t.mu.Lock()
 	defer t.mu.Unlock()
-	
+
 	if !t.active {
-		return storage.NewTransactionError("TRANSACTION_CLOSED", "transaction is not active")
+		return domain.NewTransactionError("TRANSACTION_CLOSED", "transaction is not active")
 	}
-	
+
 	err := t.tx.Commit(context.Background())
 	if err != nil {
-		return storage.NewTransactionError("COMMIT_FAILED", err.Error()).WithCause(err)
+		return domain.NewTransactionError("COMMIT_FAILED", err.Error()).WithCause(err)
 	}
-	
+
 	t.active = false
 	return nil
 }
@@ -190,16 +190,16 @@ func (t *PostgreSQLTransaction) Commit() error {
 func (t *PostgreSQLTransaction) Rollback() error {
 	t.mu.Lock()
 	defer t.mu.Unlock()
-	
+
 	if !t.active {
-		return storage.NewTransactionError("TRANSACTION_CLOSED", "transaction is not active")
+		return domain.NewTransactionError("TRANSACTION_CLOSED", "transaction is not active")
 	}
-	
+
 	err := t.tx.Rollback(context.Background())
 	if err != nil {
-		return storage.NewTransactionError("ROLLBACK_FAILED", err.Error()).WithCause(err)
+		return domain.NewTransactionError("ROLLBACK_FAILED", err.Error()).WithCause(err)
 	}
-	
+
 	t.active = false
 	return nil
 }
@@ -208,17 +208,17 @@ func (t *PostgreSQLTransaction) Rollback() error {
 func (t *PostgreSQLTransaction) Savepoint(name string) error {
 	t.mu.RLock()
 	defer t.mu.RUnlock()
-	
+
 	if !t.active {
-		return storage.NewTransactionError("TRANSACTION_CLOSED", "transaction is not active")
+		return domain.NewTransactionError("TRANSACTION_CLOSED", "transaction is not active")
 	}
-	
+
 	sql := fmt.Sprintf("SAVEPOINT %s", name)
 	_, err := t.tx.Exec(context.Background(), sql)
 	if err != nil {
-		return storage.NewTransactionError("SAVEPOINT_FAILED", err.Error()).WithCause(err)
+		return domain.NewTransactionError("SAVEPOINT_FAILED", err.Error()).WithCause(err)
 	}
-	
+
 	return nil
 }
 
@@ -226,17 +226,17 @@ func (t *PostgreSQLTransaction) Savepoint(name string) error {
 func (t *PostgreSQLTransaction) RollbackToSavepoint(name string) error {
 	t.mu.RLock()
 	defer t.mu.RUnlock()
-	
+
 	if !t.active {
-		return storage.NewTransactionError("TRANSACTION_CLOSED", "transaction is not active")
+		return domain.NewTransactionError("TRANSACTION_CLOSED", "transaction is not active")
 	}
-	
+
 	sql := fmt.Sprintf("ROLLBACK TO SAVEPOINT %s", name)
 	_, err := t.tx.Exec(context.Background(), sql)
 	if err != nil {
-		return storage.NewTransactionError("ROLLBACK_TO_SAVEPOINT_FAILED", err.Error()).WithCause(err)
+		return domain.NewTransactionError("ROLLBACK_TO_SAVEPOINT_FAILED", err.Error()).WithCause(err)
 	}
-	
+
 	return nil
 }
 
