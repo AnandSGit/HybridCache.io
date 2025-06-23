@@ -25,6 +25,7 @@ packages = [{include = "storage", from = "src"}]
 [tool.poetry.dependencies]
 python = "^3.11"
 asyncpg = "^0.29.0"
+motor = "^3.3.0"
 typing-extensions = "^4.8.0"
 pydantic = "^2.5.0"
 
