@@ -4,16 +4,39 @@ package mongodb
 import (
 	"context"
 	"fmt"
+	"net"
 	"net/url"
 	"strconv"
 	"strings"
 	"time"
 
 	"github.com/AnandSGit/HybridCache.io/internal/domain"
-	"go.mongodb.org/mongo-driver/mongo"
-	"go.mongodb.org/mongo-driver/mongo/options"
-	"go.mongodb.org/mongo-driver/mongo/readpref"
+	"go.mongodb.org/mongo-driver/v2/mongo"
+	"go.mongodb.org/mongo-driver/v2/mongo/options"
+	"go.mongodb.org/mongo-driver/v2/mongo/readpref"
 )
+
+// databaseTypes maps MongoDB type names (the $type aliases, lowercased, plus a
+// few common synonyms) to domain data types.
+var databaseTypes = map[string]domain.DataType{
+	"string":    domain.DataTypeString,
+	"int":       domain.DataTypeInteger,
+	"long":      domain.DataTypeInteger,
+	"int32":     domain.DataTypeInteger,
+	"int64":     domain.DataTypeInteger,
+	"double":    domain.DataTypeFloat,
+	"decimal":   domain.DataTypeDecimal,
+	"bool":      domain.DataTypeBoolean,
+	"boolean":   domain.DataTypeBoolean,
+	"date":      domain.DataTypeDateTime,
+	"timestamp": domain.DataTypeDateTime,
+	"bindata":   domain.DataTypeBinary,
+	"binary":    domain.DataTypeBinary,
+	"object":    domain.DataTypeJSON,
+	"document":  domain.DataTypeJSON,
+	"array":     domain.DataTypeArray,
+	"objectid":  domain.DataTypeString, // ObjectID as string
+}
 
 // Adapter implements the domain.Adapter interface for MongoDB
 type Adapter struct {
@@ -44,204 +67,179 @@ func (a *Adapter) DatabaseType() domain.DatabaseType {
 	return domain.DatabaseTypeMongoDB
 }
 
-// Connect creates a new storage instance
+// Connect creates a connected storage instance. Pool and timeout settings are
+// applied only when set, so that URI options and driver defaults stay in effect.
 func (a *Adapter) Connect(ctx context.Context, config domain.Config) (domain.Storage, error) {
 	if err := a.ValidateConfig(config); err != nil {
-		return nil, domain.NewConnectionError("INVALID_CONFIG", err.Error()).WithCause(err)
+		return nil, err
+	}
+	database := config.Database
+	if database == "" {
+		database = databaseFromDSN(config.DSN)
 	}
 
-	uri, err := a.buildURI(config)
-	if err != nil {
-		return nil, domain.NewConnectionError("INVALID_URI", "failed to build MongoDB URI").WithCause(err)
+	clientOptions := options.Client().ApplyURI(a.buildURI(config))
+	if config.MaxOpenConns > 0 {
+		clientOptions.SetMaxPoolSize(uint64(config.MaxOpenConns))
+	}
+	if config.MaxIdleConns > 0 {
+		clientOptions.SetMinPoolSize(uint64(config.MaxIdleConns))
+	}
+	if config.ConnMaxIdleTime > 0 {
+		clientOptions.SetMaxConnIdleTime(config.ConnMaxIdleTime)
+	}
+	if config.ConnectTimeout > 0 {
+		clientOptions.SetConnectTimeout(config.ConnectTimeout)
 	}
 
-	clientOptions := options.Client().ApplyURI(uri)
-
-	// Configure connection pool
-	clientOptions.SetMaxPoolSize(uint64(config.MaxOpenConns))
-	clientOptions.SetMinPoolSize(uint64(config.MaxIdleConns))
-	clientOptions.SetMaxConnIdleTime(config.ConnMaxIdleTime)
-	clientOptions.SetConnectTimeout(config.ConnectTimeout)
-	clientOptions.SetSocketTimeout(config.QueryTimeout)
-
-	// Create MongoDB client
-	client, err := mongo.Connect(ctx, clientOptions)
+	client, err := mongo.Connect(clientOptions)
 	if err != nil {
 		return nil, domain.NewConnectionError("CONNECTION_FAILED", "failed to connect to MongoDB").WithCause(err)
 	}
 
-	// Test the connection
-	if err := client.Ping(ctx, readpref.Primary()); err != nil {
-		client.Disconnect(ctx)
-		return nil, domain.NewConnectionError("PING_FAILED", "failed to ping MongoDB").WithCause(err)
+	pingCtx := ctx
+	if config.ConnectTimeout > 0 {
+		var cancel context.CancelFunc
+		pingCtx, cancel = context.WithTimeout(ctx, config.ConnectTimeout)
+		defer cancel()
+	}
+	if err := client.Ping(pingCtx, readpref.Primary()); err != nil {
+		_ = client.Disconnect(ctx)
+		if mongo.IsTimeout(err) {
+			return nil, domain.NewConnectionTimeoutError("timed out connecting to MongoDB").WithCause(err)
+		}
+		return nil, domain.NewConnectionError("CONNECTION_FAILED", "failed to ping MongoDB").WithCause(err)
 	}
 
-	storage := &MongoDBStorage{
-		client:   client,
-		database: client.Database(config.Database),
-		adapter:  a,
-		config:   config,
-	}
-
-	return storage, nil
+	return newStorage(client, database, a, config), nil
 }
 
-// ParseDSN parses a MongoDB connection string
+// ParseDSN parses a MongoDB connection string. The DSN is kept for Connect;
+// pool settings are left zero so that the driver defaults apply.
 func (a *Adapter) ParseDSN(dsn string) (domain.Config, error) {
-	config := domain.Config{
-		DSN: dsn,
-	}
-
-	// Parse MongoDB URI
 	u, err := url.Parse(dsn)
 	if err != nil {
-		return config, fmt.Errorf("invalid MongoDB URI: %w", err)
+		return domain.Config{}, invalidDSN("invalid MongoDB URI").WithCause(err)
+	}
+	if u.Scheme != "mongodb" && u.Scheme != "mongodb+srv" {
+		return domain.Config{}, invalidDSN(`MongoDB URI scheme must be "mongodb" or "mongodb+srv"`)
 	}
 
-	// Extract basic connection info
-	if u.Hostname() != "" {
-		config.Host = u.Hostname()
+	config := domain.Config{
+		DSN:      dsn,
+		Host:     u.Hostname(),
+		Database: strings.TrimPrefix(u.Path, "/"),
 	}
-	if u.Port() != "" {
-		if port, err := strconv.Atoi(u.Port()); err == nil {
-			config.Port = port
-		}
+	if port, err := strconv.Atoi(u.Port()); err == nil {
+		config.Port = port
+	} else if u.Scheme == "mongodb" {
+		config.Port = 27017
 	}
 	if u.User != nil {
 		config.Username = u.User.Username()
-		if password, ok := u.User.Password(); ok {
-			config.Password = password
-		}
+		config.Password, _ = u.User.Password()
 	}
-
-	// Extract database name from path
-	if len(u.Path) > 1 {
-		config.Database = strings.TrimPrefix(u.Path, "/")
-	}
-
-	// Parse query parameters
-	params := u.Query()
-	if len(params) > 0 {
-		if config.Options == nil {
-			config.Options = make(map[string]interface{})
-		}
+	if params := u.Query(); len(params) > 0 {
+		config.Options = make(map[string]interface{}, len(params))
 		for key, values := range params {
-			if len(values) > 0 {
-				config.Options[key] = values[0]
-			}
+			config.Options[key] = values[0]
 		}
 	}
-
-	// Set defaults
-	if config.Port == 0 {
-		config.Port = 27017
-	}
-	if config.MaxOpenConns == 0 {
-		config.MaxOpenConns = 100
-	}
-	if config.MaxIdleConns == 0 {
-		config.MaxIdleConns = 10
-	}
-	if config.ConnMaxLifetime == 0 {
-		config.ConnMaxLifetime = 1 * time.Hour
-	}
-	if config.ConnMaxIdleTime == 0 {
-		config.ConnMaxIdleTime = 30 * time.Minute
-	}
-	if config.ConnectTimeout == 0 {
-		config.ConnectTimeout = 10 * time.Second
-	}
-	if config.QueryTimeout == 0 {
-		config.QueryTimeout = 30 * time.Second
-	}
-
 	return config, nil
 }
 
-// ValidateConfig validates the configuration
+// ValidateConfig validates the configuration. Zero pool sizes select the
+// driver defaults.
 func (a *Adapter) ValidateConfig(config domain.Config) error {
-	if config.DSN == "" {
-		if config.Host == "" {
-			return fmt.Errorf("host is required")
-		}
-		if config.Database == "" {
-			return fmt.Errorf("database is required")
-		}
+	switch {
+	case config.DSN == "" && config.Host == "":
+		return invalidConfig("host is required")
+	case config.Database == "" && databaseFromDSN(config.DSN) == "":
+		return invalidConfig("database is required")
+	case config.MaxOpenConns < 0:
+		return invalidConfig("max open connections cannot be negative")
+	case config.MaxIdleConns < 0:
+		return invalidConfig("max idle connections cannot be negative")
+	case config.MaxOpenConns > 0 && config.MaxIdleConns > config.MaxOpenConns:
+		return invalidConfig("max idle connections cannot exceed max open connections")
 	}
-
-	if config.MaxOpenConns <= 0 {
-		return fmt.Errorf("max open connections must be positive")
-	}
-
-	if config.MaxIdleConns < 0 {
-		return fmt.Errorf("max idle connections cannot be negative")
-	}
-
-	if config.MaxIdleConns > config.MaxOpenConns {
-		return fmt.Errorf("max idle connections cannot exceed max open connections")
-	}
-
 	return nil
 }
 
-// buildURI builds a MongoDB connection URI from config
-func (a *Adapter) buildURI(config domain.Config) (string, error) {
+func invalidConfig(message string) *domain.StorageError {
+	return domain.NewStorageError(domain.ErrorTypeValidation, "INVALID_CONFIG", message)
+}
+
+func invalidDSN(message string) *domain.StorageError {
+	return domain.NewStorageError(domain.ErrorTypeValidation, "INVALID_DSN", message)
+}
+
+// databaseFromDSN returns the database named in a MongoDB URI's path, if any.
+func databaseFromDSN(dsn string) string {
+	if dsn == "" {
+		return ""
+	}
+	u, err := url.Parse(dsn)
+	if err != nil {
+		return ""
+	}
+	return strings.TrimPrefix(u.Path, "/")
+}
+
+// buildURI builds a MongoDB connection URI from config. The database is not put
+// in the path, where it would also become the authentication database; Connect
+// selects it with client.Database instead.
+func (a *Adapter) buildURI(config domain.Config) string {
 	if config.DSN != "" {
-		return config.DSN, nil
+		return config.DSN
 	}
 
-	// Build URI from individual components
-	var uri strings.Builder
-	uri.WriteString("mongodb://")
-
-	// Add authentication if provided
+	host := strings.TrimSuffix(strings.TrimPrefix(config.Host, "["), "]")
+	switch {
+	case config.Port > 0:
+		host = net.JoinHostPort(host, strconv.Itoa(config.Port))
+	case strings.Contains(host, ":"):
+		host = "[" + host + "]" // IPv6 literal
+	}
+	u := url.URL{Scheme: "mongodb", Host: host, Path: "/"}
 	if config.Username != "" {
-		uri.WriteString(url.QueryEscape(config.Username))
 		if config.Password != "" {
-			uri.WriteString(":")
-			uri.WriteString(url.QueryEscape(config.Password))
+			u.User = url.UserPassword(config.Username, config.Password)
+		} else {
+			u.User = url.User(config.Username)
 		}
-		uri.WriteString("@")
 	}
-
-	// Add host and port
-	uri.WriteString(config.Host)
-	if config.Port != 0 && config.Port != 27017 {
-		uri.WriteString(":")
-		uri.WriteString(strconv.Itoa(config.Port))
-	}
-
-	// Add database
-	if config.Database != "" {
-		uri.WriteString("/")
-		uri.WriteString(config.Database)
-	}
-
-	// Add options
 	if len(config.Options) > 0 {
-		uri.WriteString("?")
-		var params []string
+		query := make(url.Values, len(config.Options))
 		for key, value := range config.Options {
-			params = append(params, fmt.Sprintf("%s=%s", key, url.QueryEscape(fmt.Sprintf("%v", value))))
+			query.Set(key, fmt.Sprint(value))
 		}
-		uri.WriteString(strings.Join(params, "&"))
+		u.RawQuery = query.Encode() // sorted by key
 	}
-
-	return uri.String(), nil
+	return u.String()
 }
 
-// TranslateQuery translates a domain.Query to MongoDB operations
+// TranslateQuery renders the MongoDB operation a builder-produced query runs as
+// (for logging and debugging; parameters are inlined, so none are returned).
+// Raw SQL cannot be translated.
 func (a *Adapter) TranslateQuery(query domain.Query) (string, []interface{}, error) {
-	// MongoDB doesn't use SQL, so we'll return the query as-is for now
-	// In a full implementation, this would translate SQL-like queries to MongoDB operations
-	return query.SQL, query.Parameters, nil
+	plan, err := planQuery(query)
+	if err != nil {
+		return "", nil, err
+	}
+	s, err := plan.render()
+	return s, nil, err
 }
 
-// TranslateCommand translates a domain.Command to MongoDB operations
+// TranslateCommand renders the MongoDB operation a builder-produced command runs
+// as (see TranslateQuery).
 func (a *Adapter) TranslateCommand(command domain.Command) (string, []interface{}, error) {
-	// MongoDB doesn't use SQL, so we'll return the command as-is for now
-	// In a full implementation, this would translate SQL-like commands to MongoDB operations
-	return command.SQL, command.Parameters, nil
+	plan, err := planCommand(command)
+	if err != nil {
+		return "", nil, err
+	}
+	s, err := plan.render()
+	return s, nil, err
 }
 
 // MapGoType maps Go types to MongoDB data types
@@ -266,30 +264,16 @@ func (a *Adapter) MapGoType(goType interface{}) (domain.DataType, error) {
 	}
 }
 
-// MapDatabaseType maps MongoDB BSON types to domain data types
+// MapDatabaseType maps MongoDB BSON type names to domain data types
 func (a *Adapter) MapDatabaseType(dbType string) (domain.DataType, error) {
-	switch strings.ToLower(dbType) {
-	case "string":
-		return domain.DataTypeString, nil
-	case "int", "long", "int32", "int64":
-		return domain.DataTypeInteger, nil
-	case "double", "decimal":
-		return domain.DataTypeFloat, nil
-	case "bool", "boolean":
-		return domain.DataTypeBoolean, nil
-	case "date", "timestamp":
-		return domain.DataTypeDateTime, nil
-	case "bindata", "binary":
-		return domain.DataTypeBinary, nil
-	case "object", "document":
-		return domain.DataTypeJSON, nil
-	case "array":
-		return domain.DataTypeArray, nil
-	case "objectid":
-		return domain.DataTypeString, nil // ObjectID as string
-	default:
-		return domain.DataTypeUnknown, fmt.Errorf("unsupported MongoDB type: %s", dbType)
+	return mapDatabaseType(dbType)
+}
+
+func mapDatabaseType(dbType string) (domain.DataType, error) {
+	if dt, ok := databaseTypes[strings.ToLower(dbType)]; ok {
+		return dt, nil
 	}
+	return domain.DataTypeUnknown, fmt.Errorf("unsupported MongoDB type: %s", dbType)
 }
 
 // SupportsTransactions returns whether MongoDB supports transactions
@@ -297,9 +281,9 @@ func (a *Adapter) SupportsTransactions() bool {
 	return true // MongoDB 4.0+ supports multi-document transactions
 }
 
-// SupportsJoins returns whether MongoDB supports joins
+// SupportsJoins reports false: queries with joins are rejected as unsupported.
 func (a *Adapter) SupportsJoins() bool {
-	return true // MongoDB supports $lookup aggregation for joins
+	return false
 }
 
 // SupportsBatch returns whether MongoDB supports batch operations

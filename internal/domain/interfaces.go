@@ -4,12 +4,12 @@ package domain
 
 import (
 	"context"
-	"time"
 )
 
 // Storage is the main interface for database operations
 type Storage interface {
-	// Connection management
+	// Connection management. Adapter.Connect returns an already-connected Storage;
+	// Connect only re-verifies connectivity.
 	Connect(ctx context.Context) error
 	Close() error
 	Ping(ctx context.Context) error
@@ -26,7 +26,7 @@ type Storage interface {
 	// Batch operations
 	Batch(ctx context.Context, operations []Operation) ([]OperationResult, error)
 
-	// Schema operations (for SQL databases)
+	// Schema operations
 	CreateTable(ctx context.Context, schema TableSchema) error
 	DropTable(ctx context.Context, tableName string) error
 	AlterTable(ctx context.Context, tableName string, changes []SchemaChange) error
@@ -37,7 +37,9 @@ type Storage interface {
 	DescribeTable(ctx context.Context, tableName string) (TableSchema, error)
 }
 
-// QueryBuilder provides a fluent API for building queries
+// QueryBuilder provides a fluent API for building queries.
+// Build populates both the SQL form (Query.SQL with '?' placeholders) and the
+// structured form (Query.Spec) so that SQL and document adapters can execute it.
 type QueryBuilder interface {
 	// Selection
 	Select(fields ...string) QueryBuilder
@@ -48,7 +50,8 @@ type QueryBuilder interface {
 	From(table string) QueryBuilder
 	FromSubquery(subquery QueryBuilder, alias string) QueryBuilder
 
-	// Filtering
+	// Filtering. Where/WhereAnd conditions are combined with AND;
+	// WhereOr adds a single parenthesised OR group.
 	Where(condition Condition) QueryBuilder
 	WhereAnd(conditions ...Condition) QueryBuilder
 	WhereOr(conditions ...Condition) QueryBuilder
@@ -71,12 +74,15 @@ type QueryBuilder interface {
 	Offset(offset int) QueryBuilder
 	Page(page, size int) QueryBuilder
 
-	// Build and execute
+	// Build
 	Build() (Query, error)
 	BuildRaw() (string, []interface{}, error)
 }
 
-// Transaction represents a database transaction
+// Transaction represents a database transaction.
+// Commit, Rollback and the savepoint methods run under the context passed to
+// Storage.BeginTx (bounded by TxOptions.Timeout / Config.TxTimeout when set),
+// mirroring database/sql semantics.
 type Transaction interface {
 	// Query operations within transaction
 	Query(ctx context.Context, query Query) (Result, error)
@@ -95,39 +101,6 @@ type Transaction interface {
 	// Transaction state
 	IsActive() bool
 	ID() string
-}
-
-// ConnectionPool manages database connections
-type ConnectionPool interface {
-	// Connection management
-	Get(ctx context.Context) (Connection, error)
-	Put(conn Connection) error
-	Close() error
-
-	// Pool statistics
-	Stats() PoolStats
-	Health() PoolHealth
-
-	// Configuration
-	SetMaxOpenConns(n int)
-	SetMaxIdleConns(n int)
-	SetConnMaxLifetime(d time.Duration)
-	SetConnMaxIdleTime(d time.Duration)
-}
-
-// Connection represents a single database connection
-type Connection interface {
-	// Basic operations
-	Query(ctx context.Context, query string, args ...interface{}) (Result, error)
-	Execute(ctx context.Context, command string, args ...interface{}) (ExecuteResult, error)
-
-	// Transaction support
-	Begin(ctx context.Context) (Transaction, error)
-
-	// Connection state
-	IsValid() bool
-	LastUsed() time.Time
-	Close() error
 }
 
 // Adapter defines the interface that database-specific adapters must implement
@@ -155,82 +128,4 @@ type Adapter interface {
 	SupportsJoins() bool
 	SupportsBatch() bool
 	SupportsSchema() bool
-}
-
-// ResultMapper handles mapping between database results and Go types
-type ResultMapper interface {
-	// Mapping operations
-	MapRow(row Row, dest interface{}) error
-	MapRows(result Result, dest interface{}) error
-	MapValue(value interface{}, dest interface{}) error
-
-	// Type conversion
-	ConvertType(value interface{}, targetType DataType) (interface{}, error)
-	RegisterConverter(sourceType, targetType DataType, converter TypeConverter)
-
-	// Reflection utilities
-	GetStructFields(structType interface{}) ([]FieldInfo, error)
-	GetFieldTags(field FieldInfo) map[string]string
-}
-
-// MetricsCollector defines the interface for collecting storage metrics
-type MetricsCollector interface {
-	// Query metrics
-	RecordQueryDuration(operation string, duration time.Duration)
-	RecordQueryError(operation string, errorType string)
-	IncrementQueryCount(operation string)
-
-	// Connection metrics
-	RecordConnectionAcquired()
-	RecordConnectionReleased()
-	RecordConnectionError(errorType string)
-
-	// Transaction metrics
-	RecordTransactionStarted()
-	RecordTransactionCommitted()
-	RecordTransactionRolledBack()
-
-	// Custom metrics
-	RecordCustomMetric(name string, value float64, tags map[string]string)
-}
-
-// Logger defines the interface for storage logging
-type Logger interface {
-	Debug(msg string, fields ...Field)
-	Info(msg string, fields ...Field)
-	Warn(msg string, fields ...Field)
-	Error(msg string, fields ...Field)
-	Fatal(msg string, fields ...Field)
-
-	With(fields ...Field) Logger
-	WithContext(ctx context.Context) Logger
-}
-
-// CacheProvider defines the interface for query result caching
-type CacheProvider interface {
-	// Cache operations
-	Get(ctx context.Context, key string) ([]byte, error)
-	Set(ctx context.Context, key string, value []byte, ttl time.Duration) error
-	Delete(ctx context.Context, key string) error
-	Clear(ctx context.Context) error
-
-	// Cache statistics
-	Stats() CacheStats
-	Health() CacheHealth
-}
-
-// MigrationManager handles database schema migrations
-type MigrationManager interface {
-	// Migration operations
-	Apply(ctx context.Context, migrations []Migration) error
-	Rollback(ctx context.Context, steps int) error
-	Status(ctx context.Context) ([]MigrationStatus, error)
-
-	// Migration discovery
-	LoadMigrations(path string) ([]Migration, error)
-	ValidateMigrations(migrations []Migration) error
-
-	// Migration history
-	GetAppliedMigrations(ctx context.Context) ([]AppliedMigration, error)
-	MarkMigrationApplied(ctx context.Context, migration Migration) error
 }

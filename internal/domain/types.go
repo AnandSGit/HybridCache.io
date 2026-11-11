@@ -100,12 +100,17 @@ func (dt DataType) String() string {
 	}
 }
 
-// Query represents a database query
+// Query represents a database query.
+//
+// SQL adapters execute SQL/Parameters (raw SQL may use '?' or the database's native
+// placeholders). Document adapters such as MongoDB cannot execute SQL text and require
+// Spec, which the query builder always populates.
 type Query struct {
 	SQL        string
 	Parameters []interface{}
 	Type       QueryType
 	Options    QueryOptions
+	Spec       *QuerySpec
 }
 
 // QueryType represents the type of query
@@ -124,19 +129,50 @@ const (
 
 // QueryOptions contains query execution options
 type QueryOptions struct {
-	Timeout     time.Duration
-	CacheKey    string
-	CacheTTL    time.Duration
-	ReadOnly    bool
-	Consistency ConsistencyLevel
+	// Timeout bounds the query; when zero, Config.QueryTimeout applies (if set).
+	Timeout time.Duration
 }
 
-// Command represents a database command (INSERT, UPDATE, DELETE)
+// QuerySpec is the structured, database-neutral form of a SELECT produced by the
+// query builder.
+type QuerySpec struct {
+	Table    string
+	Fields   []string // select expressions as given; empty means all fields
+	Distinct bool
+	Where    []Condition // combined with AND
+	OrderBy  []OrderBy
+	Limit    *int
+	Offset   *int
+
+	// SQL-only features. Document adapters must reject a spec that uses them
+	// with ErrUnsupportedQuery instead of silently ignoring them.
+	Joins    []Join
+	GroupBy  []string
+	Having   []Condition // combined with AND
+	Subquery bool        // the data source is a subquery (FromSubquery)
+}
+
+// OrderBy is a single ORDER BY term
+type OrderBy struct {
+	Field     string
+	Direction SortDirection
+}
+
+// Join is a single JOIN clause
+type Join struct {
+	Type  JoinType
+	Table string
+	On    *Condition // nil for CROSS JOIN
+}
+
+// Command represents a database command (INSERT, UPDATE, DELETE).
+// As with Query, Spec carries the structured form required by document adapters.
 type Command struct {
 	SQL        string
 	Parameters []interface{}
 	Type       CommandType
 	Options    CommandOptions
+	Spec       *CommandSpec
 }
 
 // CommandType represents the type of command
@@ -153,10 +189,22 @@ const (
 
 // CommandOptions contains command execution options
 type CommandOptions struct {
-	Timeout     time.Duration
-	ReturnID    bool
-	ReturnCount bool
-	OnConflict  ConflictResolution
+	// Timeout bounds the command; when zero, Config.QueryTimeout applies (if set).
+	Timeout time.Duration
+}
+
+// CommandSpec is the structured form of an INSERT/UPDATE/DELETE produced by the
+// command builder.
+type CommandSpec struct {
+	Table  string
+	Values []FieldValue // ordered column assignments (INSERT/UPDATE)
+	Where  []Condition  // combined with AND (UPDATE/DELETE)
+}
+
+// FieldValue is a single column assignment
+type FieldValue struct {
+	Field string
+	Value interface{}
 }
 
 // Result represents query results
@@ -187,8 +235,7 @@ type Row interface {
 // ExecuteResult represents the result of a command execution
 type ExecuteResult struct {
 	RowsAffected int64
-	LastInsertID int64
-	Error        error
+	LastInsertID int64 // 0 when the database has no integer insert IDs (PostgreSQL, MongoDB)
 }
 
 // Operation represents a batch operation
@@ -213,13 +260,23 @@ type OperationResult struct {
 	Error  error
 }
 
-// Condition represents a query condition
+// Condition represents a query condition.
+//
+// Value semantics:
+//   - a ColumnRef value is rendered as a column reference, not a bound parameter
+//     (e.g. JOIN ... ON a.id = b.a_id);
+//   - for OperatorExists/OperatorNotExists, Value must be a QueryBuilder (the subquery);
+//   - for OperatorAnd/OperatorOr, the operands are in Conditions and Field is unused.
 type Condition struct {
-	Field    string
-	Operator Operator
-	Value    interface{}
-	Values   []interface{} // For IN, BETWEEN operators
+	Field      string
+	Operator   Operator
+	Value      interface{}
+	Values     []interface{} // For IN, BETWEEN operators
+	Conditions []Condition   // For AND, OR groups
 }
+
+// ColumnRef marks a condition value as a column reference rather than a literal.
+type ColumnRef string
 
 // Operator represents a comparison operator
 type Operator int
@@ -241,6 +298,8 @@ const (
 	OperatorIsNotNull
 	OperatorExists
 	OperatorNotExists
+	OperatorAnd
+	OperatorOr
 )
 
 // JoinType represents the type of join
@@ -280,25 +339,6 @@ const (
 	IsolationLevelSerializable
 )
 
-// ConsistencyLevel represents read consistency level
-type ConsistencyLevel int
-
-const (
-	ConsistencyLevelEventual ConsistencyLevel = iota
-	ConsistencyLevelStrong
-	ConsistencyLevelSession
-)
-
-// ConflictResolution represents how to handle conflicts
-type ConflictResolution int
-
-const (
-	ConflictResolutionError ConflictResolution = iota
-	ConflictResolutionIgnore
-	ConflictResolutionReplace
-	ConflictResolutionUpdate
-)
-
 // Config represents database configuration
 type Config struct {
 	// Connection details
@@ -315,10 +355,10 @@ type Config struct {
 	ConnMaxLifetime time.Duration
 	ConnMaxIdleTime time.Duration
 
-	// Timeouts
+	// Timeouts (zero means no timeout)
 	ConnectTimeout time.Duration
-	QueryTimeout   time.Duration
-	TxTimeout      time.Duration
+	QueryTimeout   time.Duration // default for QueryOptions/CommandOptions.Timeout
+	TxTimeout      time.Duration // default for TxOptions.Timeout
 
 	// SSL/TLS settings
 	SSLMode   string
@@ -364,24 +404,6 @@ const (
 	HealthStatusUnhealthy
 	HealthStatusUnknown
 )
-
-// PoolStats contains connection pool statistics
-type PoolStats struct {
-	OpenConnections int
-	IdleConnections int
-	ActiveQueries   int
-	TotalQueries    int64
-	TotalErrors     int64
-}
-
-// PoolHealth represents the health of the connection pool
-type PoolHealth struct {
-	Status           HealthStatusType
-	AvailableConns   int
-	MaxConns         int
-	AverageWaitTime  time.Duration
-	ConnectionErrors int64
-}
 
 // ColumnType represents a database column type
 type ColumnType struct {
@@ -485,68 +507,6 @@ const (
 	SchemaChangeTypeAddConstraint
 	SchemaChangeTypeDropConstraint
 )
-
-// TypeConverter represents a function that converts between types
-type TypeConverter func(value interface{}) (interface{}, error)
-
-// FieldInfo represents information about a struct field
-type FieldInfo struct {
-	Name     string
-	Type     DataType
-	Tags     map[string]string
-	Index    int
-	Embedded bool
-}
-
-// Field represents a logging field
-type Field struct {
-	Key   string
-	Value interface{}
-}
-
-// CacheStats contains cache statistics
-type CacheStats struct {
-	Hits      int64
-	Misses    int64
-	Evictions int64
-	Size      int64
-	MaxSize   int64
-	HitRatio  float64
-}
-
-// CacheHealth represents cache health
-type CacheHealth struct {
-	Status      HealthStatusType
-	Connections int
-	Memory      int64
-	MaxMemory   int64
-}
-
-// Migration represents a database migration
-type Migration struct {
-	ID          string
-	Description string
-	UpSQL       string
-	DownSQL     string
-	Version     int64
-	Checksum    string
-}
-
-// MigrationStatus represents the status of a migration
-type MigrationStatus struct {
-	Migration Migration
-	Applied   bool
-	AppliedAt time.Time
-	Error     error
-}
-
-// AppliedMigration represents an applied migration
-type AppliedMigration struct {
-	ID        string
-	Version   int64
-	AppliedAt time.Time
-	Checksum  string
-}
 
 // Value implements driver.Valuer for DataType
 func (dt DataType) Value() (driver.Value, error) {

@@ -1,406 +1,303 @@
 """
-MongoDB result handling implementation.
+Rows and results of MongoDB queries.
 
-This module provides result and row implementations for MongoDB query results
-using Motor cursors and documents.
+A row's columns are the selected fields in select order, or, for a query that
+returns whole documents, the document's fields in document order. Column names
+may be dotted paths (``address.city``) into embedded documents.
 """
 
 from __future__ import annotations
 
 import dataclasses
-from typing import Any, AsyncIterator, Dict, List, Optional
+from collections import deque
+from collections.abc import (
+    AsyncIterator,
+    Awaitable,
+    Callable,
+    Iterable,
+    Iterator,
+    Mapping,
+    MutableSequence,
+    Sequence,
+)
+from typing import Any
 
-from motor.motor_asyncio import AsyncIOMotorCursor
+from pymongo.asynchronous.cursor import AsyncCursor
 
-from storage.errors import DataError, new_data_error
+from storage.adapters.mongodb.support import DRIVER_ERRORS, bounded, driver_error
+from storage.errors import new_data_error
 from storage.interfaces import Result, Row
+
+Document = Mapping[str, Any]
+
+_MISSING: Any = object()
+
+
+def lookup(document: Document, path: str) -> Any:
+    """Return the value at ``path`` (a field name or dotted path) in ``document``,
+    or ``_MISSING``."""
+    if path in document:
+        return document[path]
+    value: Any = document
+    for key in path.split("."):
+        if not isinstance(value, Mapping) or key not in value:
+            return _MISSING
+        value = value[key]
+    return value
+
+
+def nested_document(path: str, value: Any) -> dict[str, Any]:
+    """Return ``{"a": {"b": value}}`` for the path ``a.b``: the shape of a projected
+    document, so that computed rows read like found ones."""
+    *parents, last = path.split(".")
+    document: dict[str, Any] = {last: value}
+    for key in reversed(parents):
+        document = {key: document}
+    return document
 
 
 class MongoDBRow(Row):
-    """MongoDB row implementation using BSON documents."""
-    
-    def __init__(self, document: Dict[str, Any]) -> None:
-        """Initialize MongoDB row.
-        
+    """A single document of a query result."""
+
+    def __init__(self, document: Document, columns: Sequence[str] = ()) -> None:
+        """Create a row.
+
         Args:
-            document: MongoDB document
+            document: The document.
+            columns: The selected columns; empty for a whole document.
         """
         self._document = document
-    
-    def get(self, key: str, default: Any = None) -> Any:
-        """Get a field value by key.
-        
-        Args:
-            key: Field name
-            default: Default value if key not found
-            
-        Returns:
-            Field value
-        """
-        return self._document.get(key, default)
-    
-    def keys(self) -> List[str]:
-        """Get all field names.
-        
-        Returns:
-            List of field names
-        """
-        return list(self._document.keys())
-    
-    def values(self) -> List[Any]:
-        """Get all field values.
-        
-        Returns:
-            List of field values
-        """
-        return list(self._document.values())
-    
-    def items(self) -> List[tuple[str, Any]]:
-        """Get all field name-value pairs.
-        
-        Returns:
-            List of (name, value) tuples
-        """
-        return list(self._document.items())
-    
-    def to_dict(self) -> Dict[str, Any]:
-        """Convert row to dictionary.
-        
-        Returns:
-            Dictionary representation
-        """
-        return self._document.copy()
-    
-    def __getitem__(self, key: str) -> Any:
-        """Get field value by key.
-        
-        Args:
-            key: Field name
-            
-        Returns:
-            Field value
-            
+        self._columns = tuple(columns)
+
+    async def scan(self, *destinations: Any) -> None:
+        """Store the row's values, in column order, in ``destinations``.
+
+        Python cannot assign to the caller's variables, so each destination is a
+        non-empty mutable sequence, such as ``[None]``, whose first item receives
+        the value.
+
         Raises:
-            KeyError: If key not found
+            DataError: If the destinations do not match the columns.
         """
-        return self._document[key]
-    
-    def __contains__(self, key: str) -> bool:
-        """Check if field exists.
-        
-        Args:
-            key: Field name
-            
-        Returns:
-            True if field exists
+        values = self.values()
+        if len(destinations) != len(values):
+            raise new_data_error(
+                "INVALID_DESTINATION",
+                f"expected {len(values)} destinations, got {len(destinations)}",
+            )
+        for destination in destinations:
+            if not isinstance(destination, MutableSequence) or not destination:
+                raise new_data_error(
+                    "INVALID_DESTINATION",
+                    "a destination must be a non-empty mutable sequence, such as "
+                    "[None]",
+                )
+        for destination, value in zip(destinations, values, strict=True):
+            destination[0] = value
+
+    async def scan_into(self, obj: Any) -> None:
+        """Set the attributes of ``obj`` that match columns.
+
+        For a dataclass instance its fields are set; for another object, the
+        attributes it already has.
+
+        Raises:
+            DataError: If ``obj`` is a class or an attribute cannot be set.
         """
-        return key in self._document
-    
+        if isinstance(obj, type):
+            raise new_data_error("INVALID_DESTINATION", "scan_into needs an instance")
+        if dataclasses.is_dataclass(obj):
+            names = {f.name for f in dataclasses.fields(obj)}
+            matches = [(k, v) for k, v in self.items() if k in names]
+        else:
+            matches = [(k, v) for k, v in self.items() if hasattr(obj, k)]
+        for key, value in matches:
+            try:
+                setattr(obj, key, value)
+            except (AttributeError, TypeError) as exc:
+                raise new_data_error("SCAN_FAILED", f"cannot set {key!r}") from exc
+
+    def get(self, key: str, default: Any = None) -> Any:
+        """Return the value of the field or dotted path ``key``, or ``default``."""
+        value = lookup(self._document, key)
+        return default if value is _MISSING else value
+
+    def keys(self) -> list[str]:
+        """Return the column names."""
+        return list(self._columns) if self._columns else list(self._document)
+
+    def values(self) -> list[Any]:
+        """Return the column values; a selected field the document lacks is None."""
+        return [self.get(key) for key in self.keys()]
+
+    def items(self) -> list[tuple[str, Any]]:
+        """Return the (column name, value) pairs."""
+        return [(key, self.get(key)) for key in self.keys()]
+
+    def to_dict(self) -> dict[str, Any]:
+        """Return the columns and their values as a dict."""
+        return dict(self.items())
+
+    def __getitem__(self, key: str) -> Any:
+        if key not in self.keys():
+            raise KeyError(key)
+        return self.get(key)
+
+    def __contains__(self, key: object) -> bool:
+        return key in self.keys()
+
     def __len__(self) -> int:
-        """Get number of fields.
-        
-        Returns:
-            Number of fields
-        """
-        return len(self._document)
-    
-    def __iter__(self):
-        """Iterate over field names."""
-        return iter(self._document)
-    
+        return len(self.keys())
+
+    def __iter__(self) -> Iterator[str]:
+        return iter(self.keys())
+
     def __repr__(self) -> str:
-        """String representation."""
-        return f"MongoDBRow({self._document})"
+        return f"MongoDBRow({self.to_dict()!r})"
 
 
 class MongoDBResult(Result):
-    """MongoDB result implementation using Motor cursors."""
-    
-    def __init__(self, cursor: AsyncIOMotorCursor) -> None:
-        """Initialize MongoDB result.
-        
+    """The rows of a query: read through a cursor, or held in memory (COUNT,
+    DISTINCT and batch results).
+
+    A cursor is read under the query's deadline, and is closed once its rows are
+    exhausted, when reading fails, or by ``close``.
+    """
+
+    def __init__(
+        self,
+        documents: Iterable[Document] = (),
+        columns: Sequence[str] = (),
+        *,
+        cursor: AsyncCursor[dict[str, Any]] | None = None,
+        deadline: float | None = None,
+        counter: Callable[[], Awaitable[int]] | None = None,
+    ) -> None:
+        """Create a result.
+
         Args:
-            cursor: Motor cursor
+            documents: Documents to return before those of ``cursor``.
+            columns: The selected columns; empty for whole documents.
+            cursor: The cursor of the remaining documents, if any.
+            deadline: The query's deadline, bounding reads from ``cursor``.
+            counter: Counts the query's documents on the server (``count``).
         """
+        self._buffer: deque[Document] = deque(documents)
+        self._columns = tuple(columns)
         self._cursor = cursor
-        self._closed = False
-    
-    def __aiter__(self) -> AsyncIterator[MongoDBRow]:
-        """Async iterator over result rows."""
+        self._deadline = deadline
+        self._counter = counter
+        self._size = len(self._buffer)
+        self._current: Document | None = None
+
+    @classmethod
+    async def open(
+        cls,
+        cursor: AsyncCursor[dict[str, Any]],
+        columns: Sequence[str] = (),
+        *,
+        deadline: float | None = None,
+        counter: Callable[[], Awaitable[int]] | None = None,
+    ) -> MongoDBResult:
+        """Return a result over ``cursor``, reading its first document so that the
+        query runs, and fails, here rather than on the first fetch."""
+        result = cls(columns=columns, cursor=cursor, deadline=deadline, counter=counter)
+        first = await result._next_document()
+        if first is not None:
+            result._buffer.append(first)
+        return result
+
+    def __aiter__(self) -> AsyncIterator[Row]:
         return self
-    
+
     async def __anext__(self) -> MongoDBRow:
-        """Get the next row.
-        
-        Returns:
-            Next row
-            
-        Raises:
-            StopAsyncIteration: When no more rows
-            DataError: If cursor is closed or error occurs
-        """
-        if self._closed:
+        row = await self.fetchone()
+        if row is None:
             raise StopAsyncIteration
-        
-        try:
-            document = await self._cursor.next()
-            if document is None:
-                raise StopAsyncIteration
-            return MongoDBRow(document)
-        except StopAsyncIteration:
-            raise
-        except Exception as e:
-            raise new_data_error(f"Error reading MongoDB result: {e}") from e
-    
-    async def fetchone(self) -> Optional[MongoDBRow]:
-        """Fetch the next row.
-        
-        Returns:
-            Next row or None if no more rows
-            
+        return row
+
+    async def fetchone(self) -> MongoDBRow | None:
+        """Return the next row, or ``None`` when the rows are exhausted.
+
         Raises:
-            DataError: If cursor is closed or error occurs
+            QueryError: If reading fails; ``QueryTimeoutError`` after the deadline.
         """
-        if self._closed:
-            raise new_data_error("Result cursor is closed")
-        
-        try:
-            document = await self._cursor.next()
-            if document is None:
-                return None
-            return MongoDBRow(document)
-        except StopAsyncIteration:
-            return None
-        except Exception as e:
-            raise new_data_error(f"Error fetching MongoDB row: {e}") from e
-    
-    async def fetchmany(self, size: int = 100) -> List[MongoDBRow]:
-        """Fetch multiple rows.
-        
-        Args:
-            size: Maximum number of rows to fetch
-            
-        Returns:
-            List of rows
-            
-        Raises:
-            DataError: If cursor is closed or error occurs
-        """
-        if self._closed:
-            raise new_data_error("Result cursor is closed")
-        
-        try:
-            rows = []
-            async for document in self._cursor:
-                if len(rows) >= size:
-                    break
-                rows.append(MongoDBRow(document))
-            return rows
-        except Exception as e:
-            raise new_data_error(f"Error fetching MongoDB rows: {e}") from e
-    
-    async def fetchall(self) -> List[MongoDBRow]:
-        """Fetch all remaining rows.
-        
-        Returns:
-            List of all rows
-            
-        Raises:
-            DataError: If cursor is closed or error occurs
-        """
-        if self._closed:
-            raise new_data_error("Result cursor is closed")
-        
-        try:
-            rows = []
-            async for document in self._cursor:
-                rows.append(MongoDBRow(document))
-            return rows
-        except Exception as e:
-            raise new_data_error(f"Error fetching all MongoDB rows: {e}") from e
-    
+        document = await self._next_document()
+        return None if document is None else self._row(document)
+
+    async def fetchmany(self, size: int = 1000) -> list[Row]:
+        """Return up to ``size`` of the remaining rows."""
+        rows: list[Row] = []
+        while len(rows) < size:
+            row = await self.fetchone()
+            if row is None:
+                break
+            rows.append(row)
+        return rows
+
+    async def fetchall(self) -> list[Row]:
+        """Return all remaining rows."""
+        return [self._row(document) for document in await self._remaining()]
+
     async def close(self) -> None:
-        """Close the result cursor."""
-        if not self._closed:
-            self._closed = True
-            # Motor cursors are automatically closed when exhausted or garbage collected
-            # But we can explicitly close if needed
-            if hasattr(self._cursor, 'close'):
-                await self._cursor.close()
-    
+        """Close the cursor; the result then has no more rows. Idempotent."""
+        cursor, self._cursor = self._cursor, None
+        self._buffer.clear()
+        if cursor is not None:
+            await cursor.close()
+
+    def columns(self) -> list[str]:
+        """Return the selected columns; for whole documents, the fields of the
+        current row (else of the next one, if any)."""
+        if self._columns:
+            return list(self._columns)
+        document = self._current
+        if document is None and self._buffer:
+            document = self._buffer[0]
+        return [] if document is None else list(document)
+
     async def count(self) -> int:
-        """Get the total count of documents.
-        
-        Note: This may not be accurate for all cursor types.
-        
-        Returns:
-            Estimated document count
-            
-        Raises:
-            DataError: If count operation fails
-        """
-        if self._closed:
-            raise new_data_error("Result cursor is closed")
-        
+        """Return the number of rows of the query, counted on the server (with
+        ``count_documents`` and the query's filter, skip and limit) for a result
+        read through a cursor."""
+        if self._counter is None:
+            return self._size
+        return await self._counter()
+
+    async def materialize(self) -> MongoDBResult:
+        """Read the remaining rows into a result that holds no cursor."""
+        return MongoDBResult(await self._remaining(), self._columns)
+
+    def _row(self, document: Document) -> MongoDBRow:
+        self._current = document
+        return MongoDBRow(document, self._columns)
+
+    async def _next_document(self) -> Document | None:
+        if self._buffer:
+            return self._buffer.popleft()
+        cursor = self._cursor
+        if cursor is None:
+            return None
         try:
-            # For Motor cursors, we need to use the collection's count method
-            # This is an approximation since we can't get exact count from cursor
-            collection = self._cursor.collection
-            return await collection.estimated_document_count()
-        except Exception as e:
-            raise new_data_error(f"Error getting MongoDB result count: {e}") from e
-    
-    def __repr__(self) -> str:
-        """String representation."""
-        status = "closed" if self._closed else "open"
-        return f"MongoDBResult(cursor={self._cursor}, status={status})"
+            with bounded(self._deadline):
+                document = await anext(cursor, None)
+        except DRIVER_ERRORS as exc:
+            await self.close()
+            raise driver_error(exc, "failed to read query results") from exc
+        if document is None:
+            await self.close()
+        return document
 
-
-class MongoDBBatchResult:
-    """Result for MongoDB batch operations."""
-    
-    def __init__(self, results: List[Any]) -> None:
-        """Initialize batch result.
-        
-        Args:
-            results: List of individual operation results
-        """
-        self._results = results
-    
-    @property
-    def inserted_count(self) -> int:
-        """Get number of inserted documents."""
-        count = 0
-        for result in self._results:
-            if hasattr(result, 'inserted_count'):
-                count += result.inserted_count
-            elif hasattr(result, 'inserted_id'):
-                count += 1
-        return count
-    
-    @property
-    def modified_count(self) -> int:
-        """Get number of modified documents."""
-        count = 0
-        for result in self._results:
-            if hasattr(result, 'modified_count'):
-                count += result.modified_count
-        return count
-    
-    @property
-    def deleted_count(self) -> int:
-        """Get number of deleted documents."""
-        count = 0
-        for result in self._results:
-            if hasattr(result, 'deleted_count'):
-                count += result.deleted_count
-        return count
-    
-    @property
-    def upserted_count(self) -> int:
-        """Get number of upserted documents."""
-        count = 0
-        for result in self._results:
-            if hasattr(result, 'upserted_count'):
-                count += result.upserted_count
-        return count
-    
-    @property
-    def matched_count(self) -> int:
-        """Get number of matched documents."""
-        count = 0
-        for result in self._results:
-            if hasattr(result, 'matched_count'):
-                count += result.matched_count
-        return count
-    
-    def __repr__(self) -> str:
-        """String representation."""
-        return (f"MongoDBBatchResult("
-                f"inserted={self.inserted_count}, "
-                f"modified={self.modified_count}, "
-                f"deleted={self.deleted_count}, "
-                f"upserted={self.upserted_count})")
-
-
-class MongoDBAggregateResult(Result):
-    """Result for MongoDB aggregation operations."""
-    
-    def __init__(self, cursor: AsyncIOMotorCursor, pipeline: List[Dict[str, Any]]) -> None:
-        """Initialize aggregation result.
-        
-        Args:
-            cursor: Motor cursor for aggregation results
-            pipeline: Aggregation pipeline used
-        """
-        self._cursor = cursor
-        self._pipeline = pipeline
-        self._closed = False
-    
-    @property
-    def pipeline(self) -> List[Dict[str, Any]]:
-        """Get the aggregation pipeline.
-        
-        Returns:
-            Aggregation pipeline
-        """
-        return self._pipeline.copy()
-    
-    def __aiter__(self) -> AsyncIterator[MongoDBRow]:
-        """Async iterator over aggregation results."""
-        return self
-    
-    async def __anext__(self) -> MongoDBRow:
-        """Get the next aggregation result.
-        
-        Returns:
-            Next result row
-            
-        Raises:
-            StopAsyncIteration: When no more results
-            DataError: If cursor is closed or error occurs
-        """
-        if self._closed:
-            raise StopAsyncIteration
-        
-        try:
-            document = await self._cursor.next()
-            if document is None:
-                raise StopAsyncIteration
-            return MongoDBRow(document)
-        except StopAsyncIteration:
-            raise
-        except Exception as e:
-            raise new_data_error(f"Error reading MongoDB aggregation result: {e}") from e
-    
-    async def fetchall(self) -> List[MongoDBRow]:
-        """Fetch all aggregation results.
-        
-        Returns:
-            List of all result rows
-            
-        Raises:
-            DataError: If cursor is closed or error occurs
-        """
-        if self._closed:
-            raise new_data_error("Aggregation cursor is closed")
-        
-        try:
-            rows = []
-            async for document in self._cursor:
-                rows.append(MongoDBRow(document))
-            return rows
-        except Exception as e:
-            raise new_data_error(f"Error fetching aggregation results: {e}") from e
-    
-    async def close(self) -> None:
-        """Close the aggregation cursor."""
-        if not self._closed:
-            self._closed = True
-            if hasattr(self._cursor, 'close'):
-                await self._cursor.close()
-    
-    def __repr__(self) -> str:
-        """String representation."""
-        status = "closed" if self._closed else "open"
-        return f"MongoDBAggregateResult(pipeline_stages={len(self._pipeline)}, status={status})"
+    async def _remaining(self) -> list[Document]:
+        documents = list(self._buffer)
+        self._buffer.clear()
+        cursor = self._cursor
+        if cursor is not None:
+            try:
+                with bounded(self._deadline):
+                    documents.extend(await cursor.to_list())
+            except DRIVER_ERRORS as exc:
+                raise driver_error(exc, "failed to read query results") from exc
+            finally:
+                await self.close()
+        return documents

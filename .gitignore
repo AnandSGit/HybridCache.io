@@ -1,224 +1,100 @@
-# Database Agnostic Storage Library - Multi-Language .gitignore
+# Ignore rules for the Go module (repository root) and the Python package
+# (python/). Directory names that could also be real package directories are
+# anchored with a leading "/".
 
-# =============================================================================
-# Go specific ignores
-# =============================================================================
+# --- Go ----------------------------------------------------------------------
 
-# Binaries for programs and plugins
+# Test binaries (go test -c) and native build outputs
+*.test
 *.exe
 *.exe~
 *.dll
 *.so
 *.dylib
+/bin/
 
-# Test binary, built with `go test -c`
-*.test
+# Coverage profiles and reports (make coverage writes coverage.out)
+coverage.out
+cover.out
+*.coverprofile
+coverage.html
 
-# Output of the go coverage tool, specifically when used with LiteIDE
-*.out
+# Profiles
+*.prof
+*.pprof
 
-# Dependency directories (remove the comment below to include it)
-vendor/
-
-# Go workspace file
+# Local workspace files and vendored dependencies
 go.work
+go.work.sum
+/vendor/
 
-# =============================================================================
-# Python specific ignores
-# =============================================================================
+# --- Python (python/) --------------------------------------------------------
 
-# Byte-compiled / optimized / DLL files
 __pycache__/
 *.py[cod]
 *$py.class
-
-# C extensions
-*.so
-
-# Distribution / packaging
-.Python
-build/
-develop-eggs/
-dist/
-downloads/
-eggs/
-.eggs/
-lib/
-lib64/
-parts/
-sdist/
-var/
-wheels/
-share/python-wheels/
 *.egg-info/
-.installed.cfg
-*.egg
-MANIFEST
+/python/build/
+/python/dist/
 
-# PyInstaller
-*.manifest
-*.spec
+# Virtual environments
+.venv/
+venv/
 
-# Unit test / coverage reports
-htmlcov/
+# Test, type-checker and linter caches and reports
+.pytest_cache/
+.mypy_cache/
+.dmypy.json
+dmypy.json
+.ruff_cache/
+.hypothesis/
+.benchmarks/
 .tox/
 .nox/
 .coverage
 .coverage.*
-.cache
-nosetests.xml
+htmlcov/
 coverage.xml
-*.cover
-*.py,cover
-.hypothesis/
-.pytest_cache/
-cover/
 junit.xml
-
-# Environments
-.env
-.venv
-env/
-venv/
-ENV/
-env.bak/
-venv.bak/
-
-# mypy
-.mypy_cache/
-.dmypy.json
-dmypy.json
-
-# Ruff cache
-.ruff_cache/
-
-# =============================================================================
-# IDE and Editor specific files
-# =============================================================================
-
-# VS Code
-.vscode/
-!.vscode/settings.json
-!.vscode/tasks.json
-!.vscode/launch.json
-!.vscode/extensions.json
-
-# JetBrains IDEs
-.idea/
-*.swp
-*.swo
-*~
-
-# =============================================================================
-# OS specific files
-# =============================================================================
-
-# macOS
-.DS_Store
-.DS_Store?
-._*
-.Spotlight-V100
-.Trashes
-
-# Windows
-ehthumbs.db
-Thumbs.db
-
-# =============================================================================
-# Build and deployment artifacts
-# =============================================================================
-
-# Build directories
-bin/
-build/
-dist/
-
-# Docker artifacts
-.dockerignore
-
-# =============================================================================
-# Database and log files
-# =============================================================================
-
-# Database files
-*.db
-*.sqlite
-*.sqlite3
-
-# Log files
-*.log
-logs/
-
-# =============================================================================
-# Temporary and backup files
-# =============================================================================
-
-# Temporary files
-tmp/
-temp/
-
-# Backup files
-*.bak
-*.backup
-
-# =============================================================================
-# Performance and security scan results
-# =============================================================================
-
-# Go security scans
-gosec-report.json
-govulncheck-report.json
-
-# Python security scans
 bandit-report.json
 safety-report.json
 
-# Performance profiling
-*.prof
-*.pprof
-cpu.prof
-mem.prof
-profile.svg
+# --- Local settings ----------------------------------------------------------
 
-# Benchmark results
-benchmark.txt
-benchmark.json
-.benchmarks/
-
-# =============================================================================
-# Test and coverage artifacts
-# =============================================================================
-
-# Coverage reports
-coverage.html
-coverage.out
-coverage.xml
-
-# Test containers
-.testcontainers/
-
-# =============================================================================
-# Local development files
-# =============================================================================
-
-# Local development
-local/
-.local/
-
-# Environment files
+# .env can hold local overrides, e.g. the docker-compose.yml credentials.
+.env
 .env.local
 .env.*.local
 
-# Editor backup files
+# --- Editors and operating systems -------------------------------------------
+
+.idea/
+# Shared VS Code settings may be committed; everything else there is local.
+# "**/" also covers python/.vscode/ (a bare ".vscode/*" matches only at the root).
+**/.vscode/*
+!**/.vscode/settings.json
+!**/.vscode/tasks.json
+!**/.vscode/launch.json
+!**/.vscode/extensions.json
+*.swp
+*.swo
 *~
 .#*
 \#*#
+.DS_Store
+._*
+.Spotlight-V100
+.Trashes
+Thumbs.db
+ehthumbs.db
 
-# =============================================================================
-# Repository specific ignores
-# =============================================================================
+# --- Logs, local databases, backups and scratch space ------------------------
 
-# Temporary repository files
-go-repo-files/
-python-repo-files/
-storage-python/
+*.log
+*.db
+*.sqlite
+*.sqlite3
+*.bak
+*.backup
+/tmp/
+/temp/

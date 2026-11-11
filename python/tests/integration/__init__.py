@@ -1,1 +1,1 @@
-"""Integration tests for the Database Agnostic Storage Library."""
+"""Integration tests; they need POSTGRES_DSN / MONGODB_URI and skip without them."""

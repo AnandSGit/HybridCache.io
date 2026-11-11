@@ -1,4 +1,4 @@
-package domain
+package domain_test
 
 import (
 	"testing"
@@ -62,50 +62,6 @@ func TestDataType_String(t *testing.T) {
 			assert.Equal(t, tt.expected, result)
 		})
 	}
-}
-
-func TestQuery_Creation(t *testing.T) {
-	query := domain.Query{
-		SQL:        "SELECT * FROM users WHERE id = ?",
-		Parameters: []interface{}{1},
-		Type:       domain.QueryTypeSelect,
-		Options: domain.QueryOptions{
-			Timeout:  30 * time.Second,
-			CacheKey: "user:1",
-			CacheTTL: 5 * time.Minute,
-			ReadOnly: true,
-		},
-	}
-
-	assert.Equal(t, "SELECT * FROM users WHERE id = ?", query.SQL)
-	assert.Equal(t, []interface{}{1}, query.Parameters)
-	assert.Equal(t, domain.QueryTypeSelect, query.Type)
-	assert.Equal(t, 30*time.Second, query.Options.Timeout)
-	assert.Equal(t, "user:1", query.Options.CacheKey)
-	assert.Equal(t, 5*time.Minute, query.Options.CacheTTL)
-	assert.True(t, query.Options.ReadOnly)
-}
-
-func TestCommand_Creation(t *testing.T) {
-	command := domain.Command{
-		SQL:        "INSERT INTO users (name, email) VALUES (?, ?)",
-		Parameters: []interface{}{"John Doe", "john@example.com"},
-		Type:       domain.CommandTypeInsert,
-		Options: domain.CommandOptions{
-			Timeout:     10 * time.Second,
-			ReturnID:    true,
-			ReturnCount: true,
-			OnConflict:  domain.ConflictResolutionIgnore,
-		},
-	}
-
-	assert.Equal(t, "INSERT INTO users (name, email) VALUES (?, ?)", command.SQL)
-	assert.Equal(t, []interface{}{"John Doe", "john@example.com"}, command.Parameters)
-	assert.Equal(t, domain.CommandTypeInsert, command.Type)
-	assert.Equal(t, 10*time.Second, command.Options.Timeout)
-	assert.True(t, command.Options.ReturnID)
-	assert.True(t, command.Options.ReturnCount)
-	assert.Equal(t, domain.ConflictResolutionIgnore, command.Options.OnConflict)
 }
 
 func TestCondition_Creation(t *testing.T) {

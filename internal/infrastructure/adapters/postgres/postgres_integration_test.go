@@ -1,0 +1,783 @@
+//go:build integration
+
+package postgres
+
+import (
+	"context"
+	"crypto/rand"
+	"database/sql"
+	"encoding/hex"
+	"os"
+	"testing"
+	"time"
+
+	"github.com/jackc/pgx/v5/pgconn"
+	"github.com/stretchr/testify/assert"
+	"github.com/stretchr/testify/require"
+
+	"github.com/AnandSGit/HybridCache.io/internal/domain"
+)
+
+// Run with POSTGRES_DSN=postgres://user:pass@host:port/db?sslmode=disable
+// go test -tags integration ./internal/infrastructure/adapters/postgres/
+
+func connectIT(t *testing.T, configure ...func(*domain.Config)) domain.Storage {
+	t.Helper()
+	dsn := os.Getenv("POSTGRES_DSN")
+	if dsn == "" {
+		t.Skip("POSTGRES_DSN is not set")
+	}
+
+	adapter := NewAdapter()
+	config, err := adapter.ParseDSN(dsn)
+	require.NoError(t, err)
+	for _, c := range configure {
+		c(&config)
+	}
+
+	store, err := adapter.Connect(t.Context(), config)
+	require.NoError(t, err, "Connect(ParseDSN(dsn)) must work with zero pool settings")
+	t.Cleanup(func() { _ = store.Close() })
+	return store
+}
+
+// tableIT returns a unique table name and drops the table after the test.
+func tableIT(t *testing.T, store domain.Storage, prefix string) string {
+	t.Helper()
+	var b [4]byte
+	_, _ = rand.Read(b[:])
+	name := "it_" + prefix + "_" + hex.EncodeToString(b[:])
+	t.Cleanup(func() { _ = store.DropTable(context.Background(), name) })
+	return name
+}
+
+func execIT(t *testing.T, store domain.Storage, sql string, args ...interface{}) domain.ExecuteResult {
+	t.Helper()
+	res, err := store.Execute(t.Context(), domain.Command{SQL: sql, Parameters: args})
+	require.NoError(t, err, sql)
+	return res
+}
+
+func countIT(t *testing.T, store domain.Storage, table string) int64 {
+	t.Helper()
+	row, err := store.QueryOne(t.Context(), domain.Query{SQL: `SELECT count(*) FROM "` + table + `"`})
+	require.NoError(t, err)
+	var n int64
+	require.NoError(t, row.Scan(&n))
+	return n
+}
+
+func createUsersIT(t *testing.T, store domain.Storage) string {
+	t.Helper()
+	table := tableIT(t, store, "users")
+	require.NoError(t, store.CreateTable(t.Context(), domain.TableSchema{
+		Name: table,
+		Columns: []domain.ColumnDefinition{
+			{Name: "id", DataType: domain.DataTypeInteger, PrimaryKey: true, AutoIncrement: true},
+			{Name: "user_name", DataType: domain.DataTypeString},
+			{Name: "email", DataType: domain.DataTypeString, Length: 100, Nullable: true},
+			{Name: "score", DataType: domain.DataTypeDecimal, Precision: 10, Scale: 2, Nullable: true},
+			{Name: "active", DataType: domain.DataTypeBoolean, DefaultValue: true},
+		},
+		Constraints: []domain.ConstraintDefinition{
+			{Name: table + "_email_key", Type: domain.ConstraintTypeUnique, Columns: []string{"email"}},
+		},
+	}))
+	return table
+}
+
+func TestPostgreSQLIntegration_Connect(t *testing.T) {
+	store := connectIT(t)
+	ctx := t.Context()
+
+	require.NoError(t, store.Ping(ctx))
+	require.NoError(t, store.Connect(ctx))
+	health := store.Health(ctx)
+	assert.Equal(t, domain.HealthStatusHealthy, health.Status)
+	assert.Positive(t, store.Info().Limits.MaxConnections, "the driver default pool size is reported")
+
+	_, err := NewAdapter().Connect(ctx, domain.Config{
+		Host: "127.0.0.1", Port: 1, Database: "x", Username: "x", SSLMode: "disable",
+	})
+	assert.ErrorIs(t, err, domain.ErrConnectionFailed)
+
+	require.NoError(t, store.Close())
+	assert.ErrorIs(t, store.Ping(ctx), domain.ErrConnectionFailed, "ping after Close")
+	assert.Equal(t, domain.HealthStatusUnhealthy, store.Health(ctx).Status)
+}
+
+func TestPostgreSQLIntegration_IsolationLevels(t *testing.T) {
+	store := connectIT(t)
+	ctx := t.Context()
+
+	for level, want := range map[domain.IsolationLevel]string{
+		domain.IsolationLevelDefault:         "read committed", // the server default
+		domain.IsolationLevelReadUncommitted: "read uncommitted",
+		domain.IsolationLevelReadCommitted:   "read committed",
+		domain.IsolationLevelRepeatableRead:  "repeatable read",
+		domain.IsolationLevelSerializable:    "serializable",
+	} {
+		tx, err := store.BeginTx(ctx, &domain.TxOptions{Isolation: level})
+		require.NoError(t, err)
+		row, err := tx.QueryOne(ctx, domain.Query{SQL: "SHOW transaction_isolation"})
+		require.NoError(t, err)
+		var got string
+		require.NoError(t, row.Scan(&got))
+		assert.Equal(t, want, got)
+		require.NoError(t, tx.Rollback())
+	}
+
+	short := connectIT(t, func(c *domain.Config) { c.TxTimeout = time.Millisecond })
+	tx, err := short.BeginTx(ctx, nil)
+	require.NoError(t, err)
+	time.Sleep(10 * time.Millisecond)
+	_, err = tx.Execute(ctx, domain.Command{SQL: "SELECT 1"})
+	assert.ErrorIs(t, err, domain.ErrTransactionTimeout, "Config.TxTimeout is the default")
+	_ = tx.Rollback()
+}
+
+func TestPostgreSQLIntegration_CRUD(t *testing.T) {
+	store := connectIT(t)
+	table := createUsersIT(t, store)
+	ctx := t.Context()
+	quoted := `"` + table + `"`
+
+	res := execIT(t, store, "INSERT INTO "+quoted+" (user_name, email, score) VALUES (?, ?, ?), (?, ?, ?)",
+		"ada", "ada@example.com", "12.50", "bob", nil, nil)
+	assert.Equal(t, int64(2), res.RowsAffected)
+	assert.Zero(t, res.LastInsertID)
+
+	// GENERATED BY DEFAULT allows explicit ids.
+	execIT(t, store, "INSERT INTO "+quoted+" (id, user_name) VALUES (?, ?)", 100, "explicit")
+
+	result, err := store.Query(ctx, domain.Query{
+		SQL:        "SELECT id, user_name, 'why?' AS literal FROM " + quoted + " WHERE user_name = ? -- a comment?",
+		Parameters: []interface{}{"ada"},
+	})
+	require.NoError(t, err)
+	defer result.Close()
+	require.True(t, result.Next())
+	var (
+		id      int64
+		name    string
+		literal string
+	)
+	require.NoError(t, result.Scan(&id, &name, &literal))
+	assert.Equal(t, "ada", name)
+	assert.Equal(t, "why?", literal)
+	assert.False(t, result.Next())
+	require.NoError(t, result.Err())
+	affected, err := result.RowsAffected()
+	require.NoError(t, err)
+	assert.Equal(t, int64(1), affected)
+
+	res = execIT(t, store, "UPDATE "+quoted+" SET active = ? WHERE id = ?", false, id)
+	assert.Equal(t, int64(1), res.RowsAffected)
+	res = execIT(t, store, "DELETE FROM "+quoted+" WHERE id = $1", 100) // native placeholders work too
+	assert.Equal(t, int64(1), res.RowsAffected)
+	assert.Equal(t, int64(2), countIT(t, store, table))
+}
+
+type userIT struct {
+	ID       int64
+	UserName string
+	Email    *string
+	Score    float64
+	Active   bool
+}
+
+func TestPostgreSQLIntegration_QueryOneScanRow(t *testing.T) {
+	store := connectIT(t)
+	table := createUsersIT(t, store)
+	ctx := t.Context()
+	quoted := `"` + table + `"`
+	execIT(t, store, "INSERT INTO "+quoted+" (user_name, email, score) VALUES (?, ?, ?), (?, NULL, NULL)",
+		"ada", "ada@example.com", "1234.56", "bob")
+
+	row, err := store.QueryOne(ctx, domain.Query{
+		SQL:        "SELECT id, user_name, email, score, active FROM " + quoted + " WHERE user_name = ?",
+		Parameters: []interface{}{"ada"},
+	})
+	require.NoError(t, err)
+	var ada userIT
+	require.NoError(t, row.ScanRow(&ada), "all columns map into an untagged struct")
+	assert.Positive(t, ada.ID)
+	assert.Equal(t, "ada", ada.UserName)
+	require.NotNil(t, ada.Email)
+	assert.Equal(t, "ada@example.com", *ada.Email)
+	assert.Equal(t, 1234.56, ada.Score, "numeric scans into float64")
+	assert.True(t, ada.Active)
+
+	// The same struct reused for a row with NULLs: no stale values.
+	row, err = store.QueryOne(ctx, domain.Query{
+		SQL:        "SELECT id, user_name, email, score, active FROM " + quoted + " WHERE user_name = ?",
+		Parameters: []interface{}{"bob"},
+	})
+	require.NoError(t, err)
+	require.NoError(t, row.ScanRow(&ada))
+	assert.Equal(t, "bob", ada.UserName)
+	assert.Nil(t, ada.Email)
+	assert.Zero(t, ada.Score)
+
+	var name string
+	var email *string
+	require.NoError(t, row.Scan(new(int64), &name, &email, new(*float64), new(bool)))
+	assert.Equal(t, "bob", name)
+	assert.Nil(t, email)
+
+	result, err := store.Query(ctx, domain.Query{SQL: "SELECT id, user_name, email, score, active FROM " + quoted + " ORDER BY id"})
+	require.NoError(t, err)
+	defer result.Close()
+	var users []userIT
+	for result.Next() {
+		var u userIT
+		require.NoError(t, result.ScanRow(&u))
+		users = append(users, u)
+	}
+	require.NoError(t, result.Err())
+	require.Len(t, users, 2)
+	assert.Equal(t, "ada", users[0].UserName)
+	assert.Equal(t, "bob", users[1].UserName)
+
+	types, err := result.ColumnTypes()
+	require.NoError(t, err)
+	assert.Equal(t, domain.DataTypeInteger, types[0].DataType)
+	assert.Equal(t, domain.DataTypeString, types[2].DataType)
+	assert.Equal(t, int64(100), types[2].Length)
+	assert.Equal(t, domain.DataTypeDecimal, types[3].DataType)
+	assert.Equal(t, int64(10), types[3].Precision)
+	assert.Equal(t, int64(2), types[3].Scale)
+}
+
+func TestPostgreSQLIntegration_NoRows(t *testing.T) {
+	store := connectIT(t)
+	table := createUsersIT(t, store)
+
+	row, err := store.QueryOne(t.Context(), domain.Query{
+		SQL:        `SELECT id, user_name FROM "` + table + `" WHERE id = ?`,
+		Parameters: []interface{}{-1},
+	})
+	require.NoError(t, err)
+
+	var id int64
+	err = row.Scan(&id)
+	assert.ErrorIs(t, err, domain.ErrNoRows)
+	assert.ErrorIs(t, err, sql.ErrNoRows)
+	assert.ErrorIs(t, row.ScanRow(&userIT{}), domain.ErrNoRows)
+	assert.ErrorIs(t, row.Err(), domain.ErrNoRows)
+	assert.True(t, domain.IsDataError(err))
+}
+
+func TestPostgreSQLIntegration_Batch(t *testing.T) {
+	store := connectIT(t)
+	table := createUsersIT(t, store)
+	ctx := t.Context()
+	quoted := `"` + table + `"`
+
+	insert := func(name, email string) domain.Operation {
+		return domain.Operation{Type: domain.OperationTypeCommand, Command: domain.Command{
+			SQL: "INSERT INTO " + quoted + " (user_name, email) VALUES (?, ?)", Parameters: []interface{}{name, email},
+		}}
+	}
+	selectAll := domain.Operation{Type: domain.OperationTypeQuery, Query: domain.Query{
+		SQL: "SELECT id, user_name, email, score, active FROM " + quoted + " ORDER BY user_name",
+	}}
+	count := domain.Operation{Type: domain.OperationTypeQuery, Query: domain.Query{
+		SQL: "SELECT count(*) AS n FROM " + quoted + " WHERE user_name <> ?", Parameters: []interface{}{"nobody"},
+	}}
+
+	results, err := store.Batch(ctx, []domain.Operation{
+		insert("ada", "ada@example.com"),
+		insert("bob", "bob@example.com"),
+		selectAll,
+		count,
+	})
+	require.NoError(t, err)
+	require.Len(t, results, 4)
+	for i, r := range results {
+		require.NoError(t, r.Error, "operation %d", i)
+		assert.Equal(t, i, r.Index)
+	}
+	assert.Equal(t, domain.ExecuteResult{RowsAffected: 1}, results[0].Result)
+
+	// Read the query results only now, after Batch has returned.
+	users := results[2].Result.(domain.Result)
+	defer users.Close()
+	cols, err := users.Columns()
+	require.NoError(t, err)
+	assert.Equal(t, []string{"id", "user_name", "email", "score", "active"}, cols)
+	var got []userIT
+	for users.Next() {
+		var u userIT
+		require.NoError(t, users.ScanRow(&u))
+		got = append(got, u)
+	}
+	require.NoError(t, users.Err())
+	require.Len(t, got, 2)
+	assert.Equal(t, "ada", got[0].UserName)
+	assert.Equal(t, "bob@example.com", *got[1].Email)
+
+	counted := results[3].Result.(domain.Result)
+	require.True(t, counted.Next())
+	var n int64
+	require.NoError(t, counted.Scan(&n))
+	assert.Equal(t, int64(2), n)
+
+	// A failing operation fails the whole batch atomically.
+	results, err = store.Batch(ctx, []domain.Operation{
+		insert("carol", "carol@example.com"),
+		insert("dup", "ada@example.com"),
+		count,
+	})
+	require.Error(t, err)
+	assert.ErrorIs(t, err, domain.ErrDuplicateKey)
+	assert.NoError(t, results[0].Error)
+	assert.ErrorIs(t, results[1].Error, domain.ErrDuplicateKey)
+	assert.Error(t, results[2].Error)
+	assert.Equal(t, int64(2), countIT(t, store, table), "carol's insert was rolled back with the batch")
+}
+
+func TestPostgreSQLIntegration_Transactions(t *testing.T) {
+	store := connectIT(t)
+	table := createUsersIT(t, store)
+	ctx := t.Context()
+	quoted := `"` + table + `"`
+	insert := domain.Command{SQL: "INSERT INTO " + quoted + " (user_name) VALUES (?)"}
+	withName := func(name string) domain.Command {
+		c := insert
+		c.Parameters = []interface{}{name}
+		return c
+	}
+
+	t.Run("commit", func(t *testing.T) {
+		tx, err := store.BeginTx(ctx, &domain.TxOptions{Isolation: domain.IsolationLevelSerializable})
+		require.NoError(t, err)
+		assert.True(t, tx.IsActive())
+		_, err = tx.Execute(ctx, withName("committed"))
+		require.NoError(t, err)
+
+		row, err := tx.QueryOne(ctx, domain.Query{SQL: "SELECT count(*) FROM " + quoted})
+		require.NoError(t, err)
+		var n int64
+		require.NoError(t, row.Scan(&n))
+		assert.Equal(t, int64(1), n)
+
+		results, err := tx.Batch(ctx, []domain.Operation{
+			{Type: domain.OperationTypeQuery, Query: domain.Query{SQL: "SELECT user_name FROM " + quoted}},
+		})
+		require.NoError(t, err)
+		res := results[0].Result.(domain.Result)
+		require.True(t, res.Next())
+
+		require.NoError(t, tx.Commit())
+		assert.False(t, tx.IsActive())
+		assert.ErrorIs(t, tx.Commit(), domain.ErrTransactionClosed)
+		assert.Equal(t, int64(1), countIT(t, store, table))
+	})
+
+	t.Run("rollback", func(t *testing.T) {
+		tx, err := store.BeginTx(ctx, nil)
+		require.NoError(t, err)
+		_, err = tx.Execute(ctx, withName("rolled back"))
+		require.NoError(t, err)
+		require.NoError(t, tx.Rollback())
+		assert.False(t, tx.IsActive())
+		assert.Equal(t, int64(1), countIT(t, store, table))
+	})
+
+	t.Run("savepoint", func(t *testing.T) {
+		tx, err := store.BeginTx(ctx, nil)
+		require.NoError(t, err)
+		_, err = tx.Execute(ctx, withName("kept"))
+		require.NoError(t, err)
+		require.NoError(t, tx.Savepoint("before discard"))
+		_, err = tx.Execute(ctx, withName("discarded"))
+		require.NoError(t, err)
+		require.NoError(t, tx.RollbackToSavepoint("before discard"))
+		assert.ErrorIs(t, tx.RollbackToSavepoint("unknown"), domain.ErrTransactionFailed)
+		require.NoError(t, tx.Rollback())
+
+		tx, err = store.BeginTx(ctx, nil)
+		require.NoError(t, err)
+		_, err = tx.Execute(ctx, withName("kept"))
+		require.NoError(t, err)
+		require.NoError(t, tx.Savepoint("sp"))
+		_, err = tx.Execute(ctx, withName("discarded"))
+		require.NoError(t, err)
+		require.NoError(t, tx.RollbackToSavepoint("sp"))
+		require.NoError(t, tx.Commit())
+
+		row, err := store.QueryOne(ctx, domain.Query{SQL: "SELECT count(*) FROM " + quoted + " WHERE user_name = ?", Parameters: []interface{}{"discarded"}})
+		require.NoError(t, err)
+		var n int64
+		require.NoError(t, row.Scan(&n))
+		assert.Zero(t, n)
+		assert.Equal(t, int64(2), countIT(t, store, table))
+	})
+
+	t.Run("failed statement aborts the transaction", func(t *testing.T) {
+		tx, err := store.BeginTx(ctx, nil)
+		require.NoError(t, err)
+		_, err = tx.Execute(ctx, domain.Command{SQL: "INSERT INTO " + quoted + " (id, user_name) VALUES (?, ?)", Parameters: []interface{}{-5, nil}})
+		assert.ErrorIs(t, err, domain.ErrConstraintViolation, "NOT NULL violation")
+		_, err = tx.Execute(ctx, withName("ignored"))
+		assert.ErrorIs(t, err, domain.ErrTransactionFailed, "current transaction is aborted")
+		assert.ErrorIs(t, tx.Commit(), domain.ErrTransactionFailed, "COMMIT of an aborted transaction rolls back")
+		assert.False(t, tx.IsActive())
+	})
+
+	t.Run("timeout", func(t *testing.T) {
+		tx, err := store.BeginTx(ctx, &domain.TxOptions{Timeout: 100 * time.Millisecond})
+		require.NoError(t, err)
+		_, err = tx.Execute(ctx, withName("too slow"))
+		require.NoError(t, err)
+		time.Sleep(150 * time.Millisecond)
+
+		_, err = tx.Execute(ctx, withName("after deadline"))
+		assert.ErrorIs(t, err, domain.ErrTransactionTimeout)
+		assert.ErrorIs(t, tx.Commit(), domain.ErrTransactionTimeout)
+		assert.False(t, tx.IsActive())
+		assert.Equal(t, int64(2), countIT(t, store, table), "nothing from the timed-out transaction is committed")
+	})
+
+	t.Run("read only", func(t *testing.T) {
+		tx, err := store.BeginTx(ctx, &domain.TxOptions{ReadOnly: true})
+		require.NoError(t, err)
+		_, err = tx.Execute(ctx, withName("denied"))
+		assert.Error(t, err)
+		require.NoError(t, tx.Rollback())
+	})
+
+	t.Run("concurrent transactions get distinct IDs", func(t *testing.T) {
+		ids := make(chan string, 8)
+		for i := 0; i < 8; i++ {
+			go func() {
+				tx, err := store.BeginTx(ctx, nil)
+				if err != nil {
+					ids <- ""
+					return
+				}
+				defer func() { _ = tx.Rollback() }()
+				ids <- tx.ID()
+			}()
+		}
+		seen := map[string]bool{}
+		for i := 0; i < 8; i++ {
+			id := <-ids
+			require.NotEmpty(t, id)
+			require.False(t, seen[id])
+			seen[id] = true
+		}
+	})
+}
+
+func TestPostgreSQLIntegration_DuplicateKey(t *testing.T) {
+	store := connectIT(t)
+	table := createUsersIT(t, store)
+	quoted := `"` + table + `"`
+	execIT(t, store, "INSERT INTO "+quoted+" (user_name, email) VALUES (?, ?)", "ada", "ada@example.com")
+
+	_, err := store.Execute(t.Context(), domain.Command{
+		SQL: "INSERT INTO " + quoted + " (user_name, email) VALUES (?, ?)", Parameters: []interface{}{"ada2", "ada@example.com"},
+	})
+	require.Error(t, err)
+	assert.ErrorIs(t, err, domain.ErrDuplicateKey)
+	var se *domain.StorageError
+	require.ErrorAs(t, err, &se)
+	assert.Equal(t, table+"_email_key", se.Context["key"])
+	assert.Equal(t, "23505", se.Context["sqlstate"])
+	assert.NotContains(t, se.Message, "ada@example.com")
+	var pgErr *pgconn.PgError
+	assert.ErrorAs(t, err, &pgErr)
+}
+
+func TestPostgreSQLIntegration_ErrorMapping(t *testing.T) {
+	store := connectIT(t)
+	table := createUsersIT(t, store)
+	ctx := t.Context()
+
+	_, err := store.Query(ctx, domain.Query{SQL: "SELECT * FROM it_does_not_exist_anywhere"})
+	assert.ErrorIs(t, err, domain.ErrTableNotFound)
+
+	_, err = store.QueryOne(ctx, domain.Query{SQL: `SELECT nope FROM "` + table + `"`})
+	assert.ErrorIs(t, err, domain.ErrColumnNotFound)
+	var se *domain.StorageError
+	require.ErrorAs(t, err, &se)
+	assert.Equal(t, "nope", se.Context["column"])
+
+	_, err = store.Execute(ctx, domain.Command{SQL: "SELEC 1"})
+	assert.ErrorIs(t, err, domain.ErrInvalidQuery)
+
+	result, err := store.Query(ctx, domain.Query{SQL: "SELECT 1 / (? - 1)", Parameters: []interface{}{1}})
+	if err == nil {
+		assert.False(t, result.Next())
+		err = result.Err()
+		result.Close()
+	}
+	assert.ErrorIs(t, err, domain.ErrInvalidData, "division by zero")
+
+	_, err = store.DescribeTable(ctx, "it_does_not_exist_anywhere")
+	assert.ErrorIs(t, err, domain.ErrTableNotFound)
+}
+
+func TestPostgreSQLIntegration_QueryTimeout(t *testing.T) {
+	store := connectIT(t)
+	ctx := t.Context()
+	isTimeout := func(t *testing.T, err error) {
+		t.Helper()
+		require.Error(t, err)
+		assert.ErrorIs(t, err, domain.ErrQueryTimeout)
+		assert.True(t, domain.IsTimeoutError(err))
+		assert.True(t, domain.IsRetryable(err))
+	}
+
+	start := time.Now()
+	result, err := store.Query(ctx, domain.Query{SQL: "SELECT pg_sleep(2)", Options: domain.QueryOptions{Timeout: 50 * time.Millisecond}})
+	if err == nil {
+		assert.False(t, result.Next())
+		err = result.Err()
+		result.Close()
+	}
+	isTimeout(t, err)
+	assert.Less(t, time.Since(start), time.Second)
+
+	_, err = store.Execute(ctx, domain.Command{SQL: "SELECT pg_sleep(2)", Options: domain.CommandOptions{Timeout: 50 * time.Millisecond}})
+	isTimeout(t, err)
+
+	// Config.QueryTimeout is the default.
+	short := connectIT(t, func(c *domain.Config) { c.QueryTimeout = 50 * time.Millisecond })
+	_, err = short.QueryOne(ctx, domain.Query{SQL: "SELECT pg_sleep(2)"})
+	isTimeout(t, err)
+	row, err := short.QueryOne(ctx, domain.Query{SQL: "SELECT 1"})
+	require.NoError(t, err, "the pool recovers after a timeout")
+	var one int
+	require.NoError(t, row.Scan(&one))
+
+	// A server-side statement_timeout (SQLSTATE 57014) maps the same way.
+	tx, err := store.BeginTx(ctx, nil)
+	require.NoError(t, err)
+	_, err = tx.Execute(ctx, domain.Command{SQL: "SET LOCAL statement_timeout = '50ms'"})
+	require.NoError(t, err)
+	_, err = tx.Execute(ctx, domain.Command{SQL: "SELECT pg_sleep(2)"})
+	isTimeout(t, err)
+	require.NoError(t, tx.Rollback())
+}
+
+func TestPostgreSQLIntegration_StreamingResultKeepsContext(t *testing.T) {
+	store := connectIT(t)
+
+	result, err := store.Query(t.Context(), domain.Query{
+		SQL:     "SELECT g FROM generate_series(1, 3) g",
+		Options: domain.QueryOptions{Timeout: 5 * time.Second},
+	})
+	require.NoError(t, err)
+	defer result.Close()
+	time.Sleep(50 * time.Millisecond) // the result is read after Query returned
+
+	var sum int
+	for result.Next() {
+		var g int
+		require.NoError(t, result.Scan(&g))
+		sum += g
+	}
+	require.NoError(t, result.Err())
+	assert.Equal(t, 6, sum)
+}
+
+func TestPostgreSQLIntegration_DDL(t *testing.T) {
+	store := connectIT(t)
+	ctx := t.Context()
+	parent := tableIT(t, store, "orgs")
+	child := tableIT(t, store, "members") // cleanups run in reverse: the child is dropped first
+
+	require.NoError(t, store.CreateTable(ctx, domain.TableSchema{
+		Name: parent,
+		Columns: []domain.ColumnDefinition{
+			{Name: "id", DataType: domain.DataTypeInteger, PrimaryKey: true, AutoIncrement: true},
+		},
+	}))
+
+	tricky := `it's a \ "quoted" default; DROP TABLE x; --`
+	require.NoError(t, store.CreateTable(ctx, domain.TableSchema{
+		Name: child,
+		Columns: []domain.ColumnDefinition{
+			{Name: "id", DataType: domain.DataTypeInteger, PrimaryKey: true, AutoIncrement: true},
+			{Name: "org_id", DataType: domain.DataTypeInteger},
+			{Name: "Display Name", DataType: domain.DataTypeString, Length: 50, DefaultValue: tricky},
+			{Name: "joined", DataType: domain.DataTypeDate, Nullable: true, DefaultValue: time.Date(2024, 2, 29, 0, 0, 0, 0, time.UTC)},
+			{Name: "ratio", DataType: domain.DataTypeDecimal, Precision: 5, Scale: 2, Nullable: true, DefaultValue: 0.5},
+		},
+		Indexes: []domain.IndexDefinition{
+			{Name: child + "_org_idx", Columns: []string{"org_id", "Display Name"}},
+		},
+		Constraints: []domain.ConstraintDefinition{
+			{Name: child + "_org_fk", Type: domain.ConstraintTypeForeignKey, Columns: []string{"org_id"},
+				RefTable: parent, RefColumns: []string{"id"}, OnDelete: domain.ReferentialActionCascade},
+			{Name: child + "_name_key", Type: domain.ConstraintTypeUnique, Columns: []string{"org_id", "Display Name"}},
+		},
+	}))
+
+	execIT(t, store, `INSERT INTO "`+parent+`" (id) VALUES (?)`, 1)
+	execIT(t, store, `INSERT INTO "`+child+`" (org_id) VALUES (?)`, 1)
+	row, err := store.QueryOne(ctx, domain.Query{SQL: `SELECT "Display Name", ratio FROM "` + child + `"`})
+	require.NoError(t, err)
+	var display string
+	var ratio float64
+	require.NoError(t, row.Scan(&display, &ratio))
+	assert.Equal(t, tricky, display, "string defaults are rendered as literals")
+	assert.Equal(t, 0.5, ratio)
+
+	_, err = store.Execute(ctx, domain.Command{SQL: `INSERT INTO "` + child + `" (org_id) VALUES (?)`, Parameters: []interface{}{42}})
+	assert.ErrorIs(t, err, domain.ErrConstraintViolation, "foreign key")
+	_, err = store.Execute(ctx, domain.Command{SQL: `INSERT INTO "` + child + `" (org_id) VALUES (?)`, Parameters: []interface{}{1}})
+	assert.ErrorIs(t, err, domain.ErrDuplicateKey, "unique constraint on the defaulted name")
+
+	assert.True(t, indexExistsIT(t, store, child+"_org_idx"))
+	assert.True(t, constraintExistsIT(t, store, child+"_org_fk"))
+
+	schema, err := store.DescribeTable(ctx, child)
+	require.NoError(t, err)
+	require.Len(t, schema.Columns, 5)
+	assert.Equal(t, domain.ColumnDefinition{Name: "id", DataType: domain.DataTypeInteger, AutoIncrement: true, PrimaryKey: true}, schema.Columns[0])
+	assert.Equal(t, "Display Name", schema.Columns[2].Name)
+	assert.Equal(t, int64(50), schema.Columns[2].Length)
+	assert.False(t, schema.Columns[2].Nullable)
+	assert.Equal(t, domain.DataTypeDecimal, schema.Columns[4].DataType)
+	assert.Equal(t, int64(5), schema.Columns[4].Precision)
+	assert.Equal(t, int64(2), schema.Columns[4].Scale)
+
+	tables, err := store.ListTables(ctx)
+	require.NoError(t, err)
+	assert.Contains(t, tables, parent)
+	assert.Contains(t, tables, child)
+
+	err = store.CreateTable(ctx, domain.TableSchema{Name: child, Columns: []domain.ColumnDefinition{{Name: "x", DataType: domain.DataTypeInteger}}})
+	assert.ErrorIs(t, err, domain.ErrSchemaExists)
+
+	require.NoError(t, store.AlterTable(ctx, child, []domain.SchemaChange{
+		{Type: domain.SchemaChangeTypeAddColumn, Column: domain.ColumnDefinition{Name: "nick", DataType: domain.DataTypeString, Length: 10, Nullable: true}},
+		{Type: domain.SchemaChangeTypeModifyColumn, Column: domain.ColumnDefinition{Name: "nick", DataType: domain.DataTypeText, Nullable: true, DefaultValue: "n/a"}},
+		{Type: domain.SchemaChangeTypeDropIndex, Index: domain.IndexDefinition{Name: child + "_org_idx"}},
+		{Type: domain.SchemaChangeTypeAddIndex, Index: domain.IndexDefinition{Name: child + "_nick_idx", Columns: []string{"nick"}, Unique: true}},
+		{Type: domain.SchemaChangeTypeDropConstraint, Constraint: domain.ConstraintDefinition{Name: child + "_name_key"}},
+		{Type: domain.SchemaChangeTypeAddConstraint, Constraint: domain.ConstraintDefinition{Name: child + "_ratio_key", Type: domain.ConstraintTypeUnique, Columns: []string{"ratio"}}},
+		{Type: domain.SchemaChangeTypeDropColumn, Column: domain.ColumnDefinition{Name: "joined"}},
+	}))
+	assert.False(t, indexExistsIT(t, store, child+"_org_idx"))
+	assert.True(t, indexExistsIT(t, store, child+"_nick_idx"))
+	assert.False(t, constraintExistsIT(t, store, child+"_name_key"))
+	assert.True(t, constraintExistsIT(t, store, child+"_ratio_key"))
+
+	schema, err = store.DescribeTable(ctx, child)
+	require.NoError(t, err)
+	nick := schema.Columns[len(schema.Columns)-1]
+	assert.Equal(t, "nick", nick.Name)
+	assert.Equal(t, domain.DataTypeString, nick.DataType, "text")
+	assert.Equal(t, int64(0), nick.Length, "varchar(10) became text")
+	assert.True(t, nick.Nullable)
+	assert.Equal(t, "'n/a'::text", nick.DefaultValue)
+
+	// SET NOT NULL is applied when the definition is not nullable.
+	execIT(t, store, `UPDATE "`+child+`" SET nick = ?`, "set")
+	require.NoError(t, store.AlterTable(ctx, child, []domain.SchemaChange{
+		{Type: domain.SchemaChangeTypeModifyColumn, Column: domain.ColumnDefinition{Name: "nick", DataType: domain.DataTypeString, Length: 20}},
+	}))
+	schema, err = store.DescribeTable(ctx, child)
+	require.NoError(t, err)
+	nick = schema.Columns[len(schema.Columns)-1]
+	assert.False(t, nick.Nullable)
+	assert.Equal(t, int64(20), nick.Length)
+	assert.Nil(t, nick.DefaultValue, "DROP DEFAULT")
+
+	// AlterTable is atomic: a failing change leaves the table untouched.
+	err = store.AlterTable(ctx, child, []domain.SchemaChange{
+		{Type: domain.SchemaChangeTypeAddColumn, Column: domain.ColumnDefinition{Name: "partial", DataType: domain.DataTypeInteger, Nullable: true}},
+		{Type: domain.SchemaChangeTypeDropColumn, Column: domain.ColumnDefinition{Name: "no_such_column"}},
+	})
+	assert.ErrorIs(t, err, domain.ErrColumnNotFound)
+	schema, err = store.DescribeTable(ctx, child)
+	require.NoError(t, err)
+	for _, c := range schema.Columns {
+		assert.NotEqual(t, "partial", c.Name)
+	}
+
+	// CreateTable is atomic too: a bad index means no table.
+	broken := tableIT(t, store, "broken")
+	err = store.CreateTable(ctx, domain.TableSchema{
+		Name:    broken,
+		Columns: []domain.ColumnDefinition{{Name: "a", DataType: domain.DataTypeInteger}},
+		Indexes: []domain.IndexDefinition{{Name: broken + "_idx", Columns: []string{"missing"}}},
+	})
+	assert.ErrorIs(t, err, domain.ErrColumnNotFound)
+	_, err = store.DescribeTable(ctx, broken)
+	assert.ErrorIs(t, err, domain.ErrTableNotFound)
+}
+
+func indexExistsIT(t *testing.T, store domain.Storage, name string) bool {
+	t.Helper()
+	row, err := store.QueryOne(t.Context(), domain.Query{SQL: "SELECT count(*) FROM pg_indexes WHERE indexname = ?", Parameters: []interface{}{name}})
+	require.NoError(t, err)
+	var n int
+	require.NoError(t, row.Scan(&n))
+	return n == 1
+}
+
+func constraintExistsIT(t *testing.T, store domain.Storage, name string) bool {
+	t.Helper()
+	row, err := store.QueryOne(t.Context(), domain.Query{SQL: "SELECT count(*) FROM pg_constraint WHERE conname = ?", Parameters: []interface{}{name}})
+	require.NoError(t, err)
+	var n int
+	require.NoError(t, row.Scan(&n))
+	return n == 1
+}
+
+func TestPostgreSQLIntegration_JSONBOperators(t *testing.T) {
+	store := connectIT(t)
+	ctx := t.Context()
+	table := tableIT(t, store, "docs")
+	require.NoError(t, store.CreateTable(ctx, domain.TableSchema{
+		Name:    table,
+		Columns: []domain.ColumnDefinition{{Name: "doc", DataType: domain.DataTypeJSON}},
+	}))
+	quoted := `"` + table + `"`
+	execIT(t, store, "INSERT INTO "+quoted+" (doc) VALUES (?), (?)", `{"a": 1, "note": "why?"}`, `{"b": 2}`)
+
+	count := func(sql string, args ...interface{}) int {
+		t.Helper()
+		row, err := store.QueryOne(ctx, domain.Query{SQL: sql, Parameters: args})
+		require.NoError(t, err, sql)
+		var n int
+		require.NoError(t, row.Scan(&n))
+		return n
+	}
+	assert.Equal(t, 1, count("SELECT count(*) FROM "+quoted+" WHERE doc ?? ?", "a"), "?? is the escaped ? operator")
+	assert.Equal(t, 2, count("SELECT count(*) FROM "+quoted+" WHERE doc ?| ?", []string{"a", "b"}))
+	assert.Equal(t, 0, count("SELECT count(*) FROM "+quoted+" WHERE doc ?& ?", []string{"a", "b"}))
+	assert.Equal(t, 1, count("SELECT count(*) FROM "+quoted+" WHERE doc ? $1", "b"), "native SQL is untouched")
+	assert.Equal(t, 1, count("SELECT count(*) FROM "+quoted+" WHERE doc->>'note' = 'why?' AND doc ?? ?", "a"))
+
+	type docRow struct {
+		Doc map[string]any
+	}
+	result, err := store.Query(ctx, domain.Query{SQL: "SELECT doc FROM " + quoted + " WHERE doc ?? ?", Parameters: []interface{}{"b"}})
+	require.NoError(t, err)
+	defer result.Close()
+	require.True(t, result.Next())
+	var d docRow
+	require.NoError(t, result.ScanRow(&d))
+	assert.Equal(t, map[string]any{"b": float64(2)}, d.Doc)
+}
+
+func TestPostgreSQLIntegration_ConfigOptions(t *testing.T) {
+	store := connectIT(t, func(c *domain.Config) {
+		c.Options["application_name"] = "hc it's \\ test"
+		c.MaxOpenConns = 3
+		c.MaxIdleConns = 1
+	})
+	row, err := store.QueryOne(t.Context(), domain.Query{SQL: "SELECT current_setting('application_name')"})
+	require.NoError(t, err)
+	var name string
+	require.NoError(t, row.Scan(&name))
+	assert.Equal(t, "hc it's \\ test", name, "option values are escaped in the DSN")
+	assert.Equal(t, 3, store.Info().Limits.MaxConnections)
+}

@@ -1,32 +1,80 @@
 """
-PostgreSQL connection and storage implementation.
+PostgreSQL storage: an asyncpg connection pool running queries, commands,
+transactions, batches and schema operations.
 
-This module provides the main storage implementation for PostgreSQL using asyncpg
-for high-performance async database operations.
+How ``Config`` maps to asyncpg:
+
+- ``max_open_conns`` is the pool's ``max_size`` and ``max_idle_conns`` its
+  ``min_size`` (connections kept open).
+- ``conn_max_idle_time`` is ``max_inactive_connection_lifetime``; ``None`` never
+  closes a connection for being idle.
+- ``conn_max_lifetime``: asyncpg has no connection lifetime, so the storage
+  expires the pooled connections (``Pool.expire_connections``) once per
+  ``conn_max_lifetime``, checked whenever it takes a connection from the pool.
+  No connection older than ``conn_max_lifetime`` is handed out; one in use is
+  replaced when it is given back.
+- ``connect_timeout`` bounds opening each connection; the DSN, connection fields,
+  ``options`` and SSL settings are described in ``dsn.connect_arguments``.
+- ``query_timeout`` bounds each query and command whose own timeout is ``None``
+  (taking a connection from the pool and running it), schema operations and
+  ``ping``; ``tx_timeout`` is the default ``TxOptions.timeout``.
+
+``json`` and ``jsonb`` values are encoded with ``json.dumps``, except ``str``
+values, which are sent as JSON text as they are; they are decoded with
+``json.loads``.
 """
 
 from __future__ import annotations
 
 import asyncio
 import datetime
-import logging
-from typing import Any, Dict, List, Optional
+import json
+from collections.abc import AsyncIterator, Sequence
+from contextlib import asynccontextmanager
+from typing import Any
 
 import asyncpg
 
-from storage.adapters.postgresql.result import PostgreSQLResult, PostgreSQLRow
-from storage.adapters.postgresql.transaction import PostgreSQLTransaction
-from storage.errors import (
-    ConnectionError,
-    QueryError,
-    SchemaError,
-    new_connection_error,
-    new_connection_timeout_error,
-    new_query_error,
-    new_schema_error,
-    wrap_error,
+from storage.adapters.postgresql.dsn import (
+    DEFAULT_PORT,
+    connect_arguments,
+    redact_dsn,
+    validate_config,
 )
-from storage.interfaces import Storage
+from storage.adapters.postgresql.errors import OpKind, map_error, translate_errors
+from storage.adapters.postgresql.executor import (
+    Connection,
+    Deadline,
+    Executor,
+    Statement,
+    positive_seconds,
+)
+from storage.adapters.postgresql.result import PostgreSQLResult, PostgreSQLRow
+from storage.adapters.postgresql.schema import (
+    DESCRIBE_TABLE_SQL,
+    LIST_TABLES_SQL,
+    TABLE_EXISTS_SQL,
+    alter_table_statements,
+    create_table_statements,
+    describe_table,
+)
+from storage.adapters.postgresql.sql import quote_table, split_table_name
+from storage.adapters.postgresql.transaction import (
+    PostgreSQLTransaction,
+    begin_statement,
+)
+from storage.errors import (
+    ConnectionClosedError,
+    ConnectionFailedError,
+    ConnectionTimeoutError,
+    InvalidConfigError,
+    InvalidTransactionError,
+    StorageError,
+    StorageTimeoutError,
+    new_query_timeout_error,
+    new_table_not_found_error,
+)
+from storage.interfaces import Row, Storage
 from storage.types import (
     Command,
     Config,
@@ -36,380 +84,370 @@ from storage.types import (
     HealthStatusType,
     Operation,
     OperationResult,
-    OperationType,
     Query,
+    SchemaChange,
     StorageInfo,
     StorageLimits,
     TableSchema,
     TxOptions,
 )
 
-logger = logging.getLogger(__name__)
+VERSION = "1.0.0"
 
 
 class PostgreSQLStorage(Storage):
-    """PostgreSQL storage implementation using asyncpg."""
-    
+    """PostgreSQL storage on an asyncpg connection pool.
+
+    ``PostgreSQLAdapter.connect`` returns it connected; a storage created
+    directly opens its pool on ``connect()``. Results are buffered, so they hold
+    no connection.
+    """
+
     def __init__(self, config: Config) -> None:
-        """Initialize PostgreSQL storage.
-        
-        Args:
-            config: Database configuration
-        """
         self._config = config
-        self._pool: Optional[asyncpg.Pool] = None
+        self._pool: Any = None  # asyncpg.Pool
         self._closed = False
-    
+        self._executor = Executor(config.query_timeout)
+        self._lifetime: float | None = None
+        self._generation_started = 0.0
+
     async def connect(self) -> None:
-        """Establish connection to the database.
-        
-        Raises:
-            ConnectionError: If connection fails
-        """
-        try:
-            # Build connection parameters
-            connect_kwargs = self._build_connect_kwargs()
-            
-            # Create connection pool
-            self._pool = await asyncpg.create_pool(
-                min_size=self._config.max_idle_conns,
-                max_size=self._config.max_open_conns,
-                max_inactive_connection_lifetime=self._config.conn_max_idle_time.total_seconds(),
-                **connect_kwargs
-            )
-            
-            logger.info("Connected to PostgreSQL database")
-            
-        except asyncio.TimeoutError as e:
-            raise new_connection_timeout_error("Connection timeout") from e
-        except Exception as e:
-            raise new_connection_error("CONNECTION_FAILED", f"Failed to connect: {e}") from e
-    
-    async def close(self) -> None:
-        """Close the database connection and cleanup resources."""
-        if self._pool and not self._closed:
-            await self._pool.close()
-            self._closed = True
-            logger.info("Closed PostgreSQL connection pool")
-    
-    async def ping(self) -> None:
-        """Test the database connection.
-        
-        Raises:
-            ConnectionError: If ping fails
-        """
-        if not self._pool or self._closed:
-            raise new_connection_error("CONNECTION_CLOSED", "Connection is closed")
-        
-        try:
-            async with self._pool.acquire() as conn:
-                await conn.fetchval("SELECT 1")
-        except Exception as e:
-            raise new_connection_error("PING_FAILED", f"Ping failed: {e}") from e
-    
-    async def query(self, query: Query) -> PostgreSQLResult:
-        """Execute a query.
-        
-        Args:
-            query: The query to execute
-            
-        Returns:
-            Query results
-            
-        Raises:
-            QueryError: If query execution fails
-        """
-        if not self._pool or self._closed:
-            raise new_query_error("CONNECTION_CLOSED", "Connection is closed")
-        
-        try:
-            async with self._pool.acquire() as conn:
-                # Convert ? placeholders to $n format
-                sql = self._convert_placeholders(query.sql)
-                
-                # Execute query with timeout
-                if query.timeout:
-                    result = await asyncio.wait_for(
-                        conn.fetch(sql, *query.parameters),
-                        timeout=query.timeout.total_seconds()
-                    )
-                else:
-                    result = await conn.fetch(sql, *query.parameters)
-                
-                return PostgreSQLResult(result, conn)
-                
-        except asyncio.TimeoutError as e:
-            raise new_query_error("QUERY_TIMEOUT", f"Query timeout: {query.sql[:100]}...") from e
-        except Exception as e:
-            raise new_query_error("QUERY_FAILED", f"Query failed: {e}") from e
-    
-    async def query_one(self, query: Query) -> Optional[PostgreSQLRow]:
-        """Execute a query and return a single row.
-        
-        Args:
-            query: The query to execute
-            
-        Returns:
-            Single row or None
-            
-        Raises:
-            QueryError: If query execution fails
-        """
-        result = await self.query(query)
-        return await result.fetchone()
-    
-    async def execute(self, command: Command) -> ExecuteResult:
-        """Execute a command.
-        
-        Args:
-            command: The command to execute
-            
-        Returns:
-            Execution result
-            
-        Raises:
-            QueryError: If command execution fails
-        """
-        if not self._pool or self._closed:
-            raise new_query_error("CONNECTION_CLOSED", "Connection is closed")
-        
-        try:
-            async with self._pool.acquire() as conn:
-                # Convert ? placeholders to $n format
-                sql = self._convert_placeholders(command.sql)
-                
-                # Execute command with timeout
-                if command.timeout:
-                    result = await asyncio.wait_for(
-                        conn.execute(sql, *command.parameters),
-                        timeout=command.timeout.total_seconds()
-                    )
-                else:
-                    result = await conn.execute(sql, *command.parameters)
-                
-                # Parse result to get rows affected
-                rows_affected = self._parse_execute_result(result)
-                
-                return ExecuteResult(rows_affected=rows_affected)
-                
-        except asyncio.TimeoutError as e:
-            raise new_query_error("COMMAND_TIMEOUT", f"Command timeout: {command.sql[:100]}...") from e
-        except Exception as e:
-            raise new_query_error("COMMAND_FAILED", f"Command failed: {e}") from e
-    
-    async def begin_tx(self, options: Optional[TxOptions] = None) -> PostgreSQLTransaction:
-        """Begin a new transaction.
-
-        Args:
-            options: Transaction options
-
-        Returns:
-            New transaction
+        """Open the connection pool and check that the database answers; when
+        the pool is open already, only check (``ping``).
 
         Raises:
-            TransactionError: If transaction creation fails
+            InvalidConfigError: If the configuration is invalid
+                (``InvalidDSNError`` for its DSN).
+            ConnectionClosedError: If the storage has been closed.
+            ConnectionFailedError: If the database cannot be reached.
+            ConnectionTimeoutError: If connecting timed out.
         """
-        if not self._pool or self._closed:
-            raise new_query_error("CONNECTION_CLOSED", "Connection is closed")
-
-        conn = await self._pool.acquire()
-        tx = PostgreSQLTransaction(conn, self._pool, options or TxOptions())
-        await tx._begin()  # Start the transaction
-        return tx
-    
-    async def batch(self, operations: List[Operation]) -> List[OperationResult]:
-        """Execute multiple operations in a batch.
-        
-        Args:
-            operations: List of operations to execute
-            
-        Returns:
-            List of operation results
-            
-        Raises:
-            QueryError: If any operation fails
-        """
-        results = []
-        
-        for i, operation in enumerate(operations):
-            try:
-                if operation.operation_type == OperationType.QUERY and operation.query:
-                    result = await self.query(operation.query)
-                    results.append(OperationResult(index=i, result=result))
-                elif operation.operation_type == OperationType.COMMAND and operation.command:
-                    result = await self.execute(operation.command)
-                    results.append(OperationResult(index=i, result=result))
-                else:
-                    raise ValueError(f"Invalid operation at index {i}")
-            except Exception as e:
-                results.append(OperationResult(index=i, error=e))
-        
-        return results
-    
-    async def create_table(self, schema: TableSchema) -> None:
-        """Create a table.
-        
-        Args:
-            schema: Table schema definition
-            
-        Raises:
-            SchemaError: If table creation fails
-        """
-        # This is a simplified implementation
-        # In a full implementation, you would build the CREATE TABLE SQL
-        # from the schema definition
-        raise NotImplementedError("create_table not yet implemented")
-    
-    async def drop_table(self, table_name: str) -> None:
-        """Drop a table.
-        
-        Args:
-            table_name: Name of the table to drop
-            
-        Raises:
-            SchemaError: If table drop fails
-        """
-        try:
-            sql = f"DROP TABLE IF EXISTS {table_name}"
-            command = Command(sql=sql, parameters=[])
-            await self.execute(command)
-        except Exception as e:
-            raise new_schema_error("DROP_TABLE_FAILED", f"Failed to drop table {table_name}: {e}") from e
-    
-    async def list_tables(self) -> List[str]:
-        """List all tables.
-        
-        Returns:
-            List of table names
-            
-        Raises:
-            SchemaError: If listing fails
-        """
-        try:
-            sql = """
-                SELECT table_name 
-                FROM information_schema.tables 
-                WHERE table_schema = 'public' 
-                ORDER BY table_name
-            """
-            query = Query(sql=sql, parameters=[])
-            result = await self.query(query)
-            
-            tables = []
-            async for row in result:
-                tables.append(row.get("table_name"))
-            
-            return tables
-            
-        except Exception as e:
-            raise new_schema_error("LIST_TABLES_FAILED", f"Failed to list tables: {e}") from e
-    
-    async def describe_table(self, table_name: str) -> TableSchema:
-        """Get table schema.
-        
-        Args:
-            table_name: Name of the table
-            
-        Returns:
-            Table schema
-            
-        Raises:
-            SchemaError: If table doesn't exist or describe fails
-        """
-        # This is a simplified implementation
-        # In a full implementation, you would query information_schema
-        # to build the complete table schema
-        raise NotImplementedError("describe_table not yet implemented")
-    
-    def info(self) -> StorageInfo:
-        """Get storage information.
-        
-        Returns:
-            Storage information
-        """
-        return StorageInfo(
-            name="PostgreSQL",
-            version="1.0.0",
-            database_type=DatabaseType.POSTGRESQL,
-            features=["transactions", "joins", "schema", "batch", "async"],
-            limits=StorageLimits(
-                max_connections=self._config.max_open_conns,
-                max_query_size=1024 * 1024,  # 1MB
-                max_transaction_age=datetime.timedelta(hours=24),
-                max_batch_size=1000,
-            ),
+        if self._pool is not None or self._closed:
+            await self.ping()
+            return
+        validate_config(self._config)
+        idle = self._config.conn_max_idle_time
+        pool = asyncpg.create_pool(
+            min_size=self._config.max_idle_conns,
+            max_size=self._config.max_open_conns,
+            max_inactive_connection_lifetime=0.0
+            if idle is None
+            else idle.total_seconds(),
+            init=_init_connection,
+            **connect_arguments(self._config),
         )
-    
-    async def health(self) -> HealthStatus:
-        """Get health status.
-        
-        Returns:
-            Health status
+        try:
+            await pool
+            await self._ping(pool)
+        except Exception as exc:
+            pool.terminate()
+            raise self._connection_error(
+                exc, "failed to connect to PostgreSQL"
+            ) from exc
+        except BaseException:
+            pool.terminate()
+            raise
+        lifetime = self._config.conn_max_lifetime
+        self._lifetime = None if lifetime is None else lifetime.total_seconds()
+        self._generation_started = asyncio.get_running_loop().time()
+        self._pool = pool
+
+    async def close(self) -> None:
+        """Close the pool, waiting for connections in use (open transactions)
+        to be given back. Closing again does nothing."""
+        self._closed = True
+        pool, self._pool = self._pool, None
+        if pool is not None:
+            await pool.close()
+
+    async def ping(self) -> None:
+        """Check that the database answers, within ``Config.query_timeout``.
+
+        Raises:
+            ConnectionClosedError: If the storage is closed or not connected.
+            ConnectionFailedError: If the database cannot be reached.
+            ConnectionTimeoutError: If it did not answer in time.
         """
+        pool = self._require_pool()
+        try:
+            await self._ping(pool)
+        except Exception as exc:
+            raise self._connection_error(exc, "PostgreSQL did not answer") from exc
+
+    async def health(self) -> HealthStatus:
+        """Return the health status with the pool's statistics."""
         try:
             await self.ping()
-            return HealthStatus(
-                status=HealthStatusType.HEALTHY,
-                message="PostgreSQL connection is healthy",
-                details={
-                    "pool_size": self._pool.get_size() if self._pool else 0,
-                    "pool_idle": self._pool.get_idle_size() if self._pool else 0,
-                    "database": self._config.database,
-                    "host": self._config.host,
-                    "port": self._config.port,
-                },
-            )
-        except Exception as e:
+        except StorageError as exc:
             return HealthStatus(
                 status=HealthStatusType.UNHEALTHY,
-                message=f"PostgreSQL connection is unhealthy: {e}",
-                details={"error": str(e)},
+                message=f"PostgreSQL connection is unhealthy: {exc.message}",
+                details={"error": exc.code},
             )
-    
-    def _build_connect_kwargs(self) -> Dict[str, Any]:
-        """Build connection parameters for asyncpg."""
-        kwargs = {}
-        
+        pool = self._require_pool()
+        return HealthStatus(
+            status=HealthStatusType.HEALTHY,
+            message="PostgreSQL connection is healthy",
+            details={
+                "pool_size": pool.get_size(),
+                "pool_idle": pool.get_idle_size(),
+                "pool_max_size": pool.get_max_size(),
+                "database": self._config.database,
+                "host": self._config.host,
+                "port": self._config.port or DEFAULT_PORT,
+            },
+        )
+
+    async def query(self, query: Query) -> PostgreSQLResult:
+        """Execute a query and return all its rows.
+
+        ``?`` placeholders are rewritten to ``$n`` (see ``convert_placeholders``);
+        SQL with ``$n`` placeholders is sent as it is.
+        """
+        statement = Statement.of(query)
+        deadline = self._executor.deadline(statement.timeout)
+        async with self._connection(deadline, statement.sql) as conn:
+            return await self._executor.fetch(conn, statement, deadline)
+
+    async def query_one(self, query: Query) -> PostgreSQLRow | None:
+        """Execute a query and return its first row, or ``None`` if it has none."""
+        statement = Statement.of(query)
+        deadline = self._executor.deadline(statement.timeout)
+        async with self._connection(deadline, statement.sql) as conn:
+            return await self._executor.fetch_one(conn, statement, deadline)
+
+    async def execute(self, command: Command) -> ExecuteResult:
+        """Execute a command. ``last_insert_id`` is always ``None`` (use
+        ``INSERT ... RETURNING`` with ``query``)."""
+        statement = Statement.of(command)
+        deadline = self._executor.deadline(statement.timeout)
+        async with self._connection(deadline, statement.sql) as conn:
+            return await self._executor.execute(conn, statement, deadline)
+
+    async def begin_tx(self, options: TxOptions | None = None) -> PostgreSQLTransaction:
+        """Begin a transaction on a pooled connection and return it, active.
+
+        Its time limit is ``options.timeout``, else ``Config.tx_timeout``, and
+        includes waiting for a connection.
+
+        Raises:
+            InvalidTransactionError: If the options are invalid.
+            TransactionTimeoutError: If no connection was free in time.
+            TransactionError: If ``BEGIN`` fails.
+        """
+        options = options or TxOptions()
+        begin = begin_statement(options)
+        timeout = (
+            self._config.tx_timeout if options.timeout is None else options.timeout
+        )
+        seconds = positive_seconds(
+            timeout, "transaction timeout", InvalidTransactionError
+        )
+        pool = self._require_pool()
+        at = None if seconds is None else asyncio.get_running_loop().time() + seconds
+        conn = await self._acquire(pool, Deadline(at, transaction=True), begin)
+        try:
+            with translate_errors(
+                OpKind.TRANSACTION, "begin transaction failed", begin
+            ):
+                async with asyncio.timeout_at(at):
+                    await conn.execute(begin)
+        except BaseException as exc:
+            if isinstance(exc, StorageTimeoutError):
+                conn.terminate()
+            await pool.release(conn)
+            raise
+        return PostgreSQLTransaction(
+            conn, pool.release, query_timeout=self._config.query_timeout, deadline=at
+        )
+
+    async def batch(self, operations: list[Operation]) -> list[OperationResult]:
+        """Execute operations in order on one connection, each on its own
+        (autocommit): a failed operation's result carries its error and the
+        others still run. ``Transaction.batch`` is all-or-nothing instead.
+
+        Raises:
+            InvalidQueryError: Before running anything, for an invalid operation.
+        """
+        if not operations:
+            return []
+        deadline = self._executor.deadline(None)
+        async with self._connection(deadline, "") as conn:
+            return await self._executor.batch(
+                conn, operations, stop_at_first_error=False
+            )
+
+    async def create_table(self, schema: TableSchema) -> None:
+        """Create a table with its primary key, foreign keys, indexes and column
+        comments, in one transaction (see ``schema.create_table_statements``).
+
+        Raises:
+            InvalidSchemaError: If the definition is invalid.
+            SchemaExistsError: If the table exists.
+            SchemaError: If creating it fails.
+        """
+        await self._run_schema(create_table_statements(schema), "create table failed")
+
+    async def drop_table(self, table_name: str) -> None:
+        """Drop a table if it exists (``"table"`` or ``"schema.table"``)."""
+        statement = f"DROP TABLE IF EXISTS {quote_table(table_name)}"
+        await self._run_schema([statement], "drop table failed")
+
+    async def alter_table(self, table_name: str, changes: list[SchemaChange]) -> None:
+        """Apply the changes in one transaction (see
+        ``schema.alter_table_statements``).
+
+        Raises:
+            InvalidSchemaError: If a change is invalid.
+            TableNotFoundError: If the table does not exist.
+            SchemaError: If a change fails.
+        """
+        quote_table(table_name)  # validates the name
+        statements = [
+            statement
+            for change in changes
+            for statement in alter_table_statements(table_name, change)
+        ]
+        if statements:
+            await self._run_schema(statements, "alter table failed")
+
+    def info(self) -> StorageInfo:
+        """Return information about the storage."""
+        return StorageInfo(
+            name="PostgreSQL",
+            version=VERSION,
+            database_type=DatabaseType.POSTGRESQL,
+            features=["transactions", "savepoints", "joins", "batch", "schema", "json"],
+            limits=StorageLimits(
+                max_connections=self._config.max_open_conns,
+                max_query_size=1024 * 1024 * 1024,  # PostgreSQL's 1 GB limit
+                max_transaction_age=datetime.timedelta(hours=24),
+                max_batch_size=10_000,
+            ),
+        )
+
+    async def list_tables(self) -> list[str]:
+        """Return the base tables of the current schema, sorted."""
+        rows = await self._introspect(LIST_TABLES_SQL, (), "list tables failed")
+        return [str(row.get("table_name")) for row in rows]
+
+    async def describe_table(self, table_name: str) -> TableSchema:
+        """Describe a table of the current schema, or of the schema named by a
+        ``"schema.table"`` name (see ``schema.describe_table``).
+
+        Raises:
+            TableNotFoundError: If the table does not exist.
+        """
+        schema, table = split_table_name(table_name)
+        rows = await self._introspect(
+            DESCRIBE_TABLE_SQL, (schema, table), "describe table failed"
+        )
+        if not rows:  # a table can have no columns: check that it exists
+            found = await self._introspect(
+                TABLE_EXISTS_SQL, (schema, table), "describe table failed"
+            )
+            if not found[0].get("exists"):
+                raise new_table_not_found_error(table_name)
+        return describe_table(table_name, rows)
+
+    def _require_pool(self) -> Any:
+        if self._pool is None:
+            state = "closed" if self._closed else "not connected"
+            raise ConnectionClosedError(f"PostgreSQL storage is {state}")
+        return self._pool
+
+    async def _ping(self, pool: Any) -> None:
+        seconds = positive_seconds(self._config.query_timeout, "query_timeout")
+        async with asyncio.timeout(seconds), pool.acquire() as conn:
+            await conn.fetchval("SELECT 1")
+
+    def _connection_error(self, error: Exception, message: str) -> StorageError:
+        if isinstance(error, StorageError):
+            return error
+        context: dict[str, Any]
         if self._config.dsn:
-            kwargs["dsn"] = self._config.dsn
+            context = {"dsn": redact_dsn(self._config.dsn)}
         else:
-            kwargs["host"] = self._config.host
-            kwargs["port"] = self._config.port
-            kwargs["database"] = self._config.database
-            kwargs["user"] = self._config.username
-            kwargs["password"] = self._config.password
-        
-        # Add timeout
-        kwargs["command_timeout"] = self._config.query_timeout.total_seconds()
-        
-        # Add SSL settings
-        if self._config.ssl_mode and self._config.ssl_mode != "disable":
-            kwargs["ssl"] = self._config.ssl_mode
-        
-        return kwargs
-    
-    def _convert_placeholders(self, sql: str) -> str:
-        """Convert ? placeholders to $n format for PostgreSQL."""
-        param_index = 1
-        result = []
-        
-        for char in sql:
-            if char == "?":
-                result.append(f"${param_index}")
-                param_index += 1
-            else:
-                result.append(char)
-        
-        return "".join(result)
-    
-    def _parse_execute_result(self, result: str) -> int:
-        """Parse execute result to get rows affected."""
-        # asyncpg returns strings like "INSERT 0 1" or "UPDATE 3"
-        if result.startswith("INSERT"):
-            parts = result.split()
-            return int(parts[2]) if len(parts) >= 3 else 0
-        elif result.startswith(("UPDATE", "DELETE")):
-            parts = result.split()
-            return int(parts[1]) if len(parts) >= 2 else 0
+            context = {
+                "host": self._config.host,
+                "port": self._config.port or DEFAULT_PORT,
+                "database": self._config.database,
+            }
+        mapped: StorageError
+        if isinstance(error, TimeoutError):
+            mapped = ConnectionTimeoutError(message, context=context)
+        elif isinstance(error, asyncpg.ClientConfigurationError):
+            mapped = InvalidConfigError("invalid connection settings", context=context)
         else:
-            return 0
+            mapped = ConnectionFailedError(message, context=context)
+        code = getattr(error, "sqlstate", None)
+        if isinstance(error, asyncpg.PostgresError) and code:
+            mapped.with_context("sqlstate", code)
+        return mapped.with_cause(error)
+
+    async def _acquire(self, pool: Any, deadline: Deadline, sql: str) -> Connection:
+        """Take a connection from the pool before ``deadline``, first expiring
+        the pool's connections when ``conn_max_lifetime`` has passed."""
+        if self._lifetime is not None:
+            now = asyncio.get_running_loop().time()
+            if now - self._generation_started >= self._lifetime:
+                self._generation_started = now
+                await pool.expire_connections()
+        try:
+            async with asyncio.timeout_at(deadline.at):
+                return await pool.acquire()
+        except TimeoutError as exc:
+            raise deadline.timeout_error(sql) from exc
+        except Exception as exc:
+            raise self._connection_error(exc, "could not get a connection") from exc
+
+    @asynccontextmanager
+    async def _connection(
+        self, deadline: Deadline, sql: str
+    ) -> AsyncIterator[Connection]:
+        pool = self._require_pool()
+        conn = await self._acquire(pool, deadline, sql)
+        try:
+            yield conn
+        finally:
+            await pool.release(conn)
+
+    async def _run_schema(self, statements: list[str], message: str) -> None:
+        """Run DDL statements in one transaction, within ``query_timeout``."""
+        deadline = self._executor.deadline(None)
+        async with self._connection(deadline, statements[0]) as conn:
+            current = statements[0]
+            try:
+                async with asyncio.timeout_at(deadline.at), conn.transaction():
+                    for statement in statements:
+                        current = statement
+                        await conn.execute(statement)
+            except TimeoutError as exc:
+                raise new_query_timeout_error(current) from exc
+            except StorageError:
+                raise
+            except Exception as exc:
+                raise map_error(exc, OpKind.SCHEMA, message, current) from exc
+
+    async def _introspect(
+        self, sql: str, parameters: Sequence[Any], message: str
+    ) -> list[Row]:
+        statement = Statement(sql, parameters, None)
+        deadline = self._executor.deadline(None)
+        async with self._connection(deadline, sql) as conn:
+            result = await self._executor.fetch(
+                conn, statement, deadline, kind=OpKind.SCHEMA, message=message
+            )
+        return await result.fetchall()
+
+
+async def _init_connection(connection: Connection) -> None:
+    """Register the JSON codecs on a new pooled connection."""
+    for type_name in ("json", "jsonb"):
+        await connection.set_type_codec(
+            type_name, schema="pg_catalog", encoder=_encode_json, decoder=json.loads
+        )
+
+
+def _encode_json(value: Any) -> str:
+    return value if isinstance(value, str) else json.dumps(value)

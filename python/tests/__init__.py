@@ -1,6 +1,6 @@
 """
-Test package for the Database Agnostic Storage Library.
+Tests for the Database Agnostic Storage Library.
 
-This package contains comprehensive tests including unit tests, integration tests,
-and performance benchmarks.
+Unit tests need no database. Integration tests need POSTGRES_DSN / MONGODB_URI and
+are skipped when those are not set.
 """

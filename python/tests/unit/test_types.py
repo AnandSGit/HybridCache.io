@@ -1,354 +1,437 @@
-"""
-Unit tests for storage types.
+"""Behaviour of the contract types (storage.types) and interfaces."""
 
-Tests all data types, enums, and dataclasses used throughout the library.
-"""
+from __future__ import annotations
 
+import asyncio
+import dataclasses
 import datetime
-from dataclasses import fields
+import enum
+from collections.abc import Callable
+from typing import Any
 
 import pytest
 
+import storage
+import storage.interfaces as storage_interfaces
+import storage.types as storage_types
+from storage.errors import TransactionFailedError
+from storage.interfaces import Adapter, Result, Row, Storage, Transaction
 from storage.types import (
+    ColumnRef,
     Command,
-    CommandType,
+    CommandSpec,
     Condition,
     Config,
-    DataType,
-    DatabaseType,
-    ErrorType,
     ExecuteResult,
     HealthStatus,
     HealthStatusType,
     IsolationLevel,
+    Join,
+    JoinType,
+    Operation,
+    OperationResult,
     Operator,
+    OrderBy,
     Query,
+    QuerySpec,
     QueryType,
     SortDirection,
-    StorageInfo,
     TableSchema,
     TxOptions,
 )
 
-
-class TestEnums:
-    """Test enum types."""
-    
-    def test_database_type_values(self):
-        """Test DatabaseType enum values."""
-        assert DatabaseType.POSTGRESQL.value == "postgresql"
-        assert DatabaseType.MYSQL.value == "mysql"
-        assert DatabaseType.SQLITE.value == "sqlite"
-        assert DatabaseType.REDIS.value == "redis"
-        assert DatabaseType.MONGODB.value == "mongodb"
-        assert DatabaseType.UNKNOWN.value == "unknown"
-    
-    def test_data_type_values(self):
-        """Test DataType enum values."""
-        assert DataType.STRING.value == "string"
-        assert DataType.INTEGER.value == "integer"
-        assert DataType.FLOAT.value == "float"
-        assert DataType.BOOLEAN.value == "boolean"
-        assert DataType.DATETIME.value == "datetime"
-        assert DataType.JSON.value == "json"
-        assert DataType.UUID.value == "uuid"
-        assert DataType.UNKNOWN.value == "unknown"
-    
-    def test_query_type_values(self):
-        """Test QueryType enum values."""
-        assert QueryType.SELECT.value == "select"
-        assert QueryType.INSERT.value == "insert"
-        assert QueryType.UPDATE.value == "update"
-        assert QueryType.DELETE.value == "delete"
-        assert QueryType.UNKNOWN.value == "unknown"
-    
-    def test_command_type_values(self):
-        """Test CommandType enum values."""
-        assert CommandType.INSERT.value == "insert"
-        assert CommandType.UPDATE.value == "update"
-        assert CommandType.DELETE.value == "delete"
-        assert CommandType.UNKNOWN.value == "unknown"
-    
-    def test_isolation_level_values(self):
-        """Test IsolationLevel enum values."""
-        assert IsolationLevel.READ_UNCOMMITTED.value == "read_uncommitted"
-        assert IsolationLevel.READ_COMMITTED.value == "read_committed"
-        assert IsolationLevel.REPEATABLE_READ.value == "repeatable_read"
-        assert IsolationLevel.SERIALIZABLE.value == "serializable"
-    
-    def test_operator_values(self):
-        """Test Operator enum values."""
-        assert Operator.EQUAL.value == "equal"
-        assert Operator.NOT_EQUAL.value == "not_equal"
-        assert Operator.GREATER_THAN.value == "greater_than"
-        assert Operator.LESS_THAN.value == "less_than"
-        assert Operator.LIKE.value == "like"
-        assert Operator.IN.value == "in"
-        assert Operator.IS_NULL.value == "is_null"
-    
-    def test_sort_direction_values(self):
-        """Test SortDirection enum values."""
-        assert SortDirection.ASC.value == "asc"
-        assert SortDirection.DESC.value == "desc"
-    
-    def test_health_status_type_values(self):
-        """Test HealthStatusType enum values."""
-        assert HealthStatusType.HEALTHY.value == "healthy"
-        assert HealthStatusType.DEGRADED.value == "degraded"
-        assert HealthStatusType.UNHEALTHY.value == "unhealthy"
-        assert HealthStatusType.UNKNOWN.value == "unknown"
-    
-    def test_error_type_values(self):
-        """Test ErrorType enum values."""
-        assert ErrorType.CONNECTION.value == "connection"
-        assert ErrorType.QUERY.value == "query"
-        assert ErrorType.TRANSACTION.value == "transaction"
-        assert ErrorType.DATA.value == "data"
-        assert ErrorType.SCHEMA.value == "schema"
-        assert ErrorType.TIMEOUT.value == "timeout"
-        assert ErrorType.VALIDATION.value == "validation"
-        assert ErrorType.UNKNOWN.value == "unknown"
+# Config
 
 
-class TestDataClasses:
-    """Test dataclass types."""
-    
-    def test_condition_creation(self):
-        """Test Condition dataclass creation."""
-        condition = Condition(
-            field="name",
-            operator=Operator.EQUAL,
-            value="test"
-        )
-        
-        assert condition.field == "name"
-        assert condition.operator == Operator.EQUAL
-        assert condition.value == "test"
-        assert condition.values is None
-    
-    def test_condition_with_values(self):
-        """Test Condition with multiple values."""
-        condition = Condition(
-            field="status",
-            operator=Operator.IN,
-            values=["active", "pending"]
-        )
-        
-        assert condition.field == "status"
-        assert condition.operator == Operator.IN
-        assert condition.values == ["active", "pending"]
-    
-    def test_query_creation(self):
-        """Test Query dataclass creation."""
-        query = Query(
-            sql="SELECT * FROM users WHERE id = ?",
-            parameters=[1],
-            query_type=QueryType.SELECT
-        )
-        
-        assert query.sql == "SELECT * FROM users WHERE id = ?"
-        assert query.parameters == [1]
-        assert query.query_type == QueryType.SELECT
-        assert query.timeout is None
-        assert query.cache_key is None
-        assert query.read_only is False
-    
-    def test_query_with_timeout(self):
-        """Test Query with timeout."""
-        timeout = datetime.timedelta(seconds=30)
-        query = Query(
-            sql="SELECT * FROM users",
-            parameters=[],
-            timeout=timeout
-        )
-        
-        assert query.timeout == timeout
-    
-    def test_command_creation(self):
-        """Test Command dataclass creation."""
-        command = Command(
-            sql="INSERT INTO users (name, email) VALUES (?, ?)",
-            parameters=["John", "john@example.com"],
-            command_type=CommandType.INSERT
-        )
-        
-        assert command.sql == "INSERT INTO users (name, email) VALUES (?, ?)"
-        assert command.parameters == ["John", "john@example.com"]
-        assert command.command_type == CommandType.INSERT
-        assert command.return_id is False
-        assert command.return_count is True
-    
-    def test_execute_result_creation(self):
-        """Test ExecuteResult dataclass creation."""
-        result = ExecuteResult(
-            rows_affected=5,
-            last_insert_id=123
-        )
-        
-        assert result.rows_affected == 5
-        assert result.last_insert_id == 123
-    
-    def test_config_creation(self):
-        """Test Config dataclass creation."""
-        config = Config(
-            host="localhost",
-            port=5432,
-            database="testdb",
-            username="testuser",
-            password="testpass"
-        )
-        
-        assert config.host == "localhost"
-        assert config.port == 5432
-        assert config.database == "testdb"
-        assert config.username == "testuser"
-        assert config.password == "testpass"
-        assert config.max_open_conns == 25  # default value
-        assert config.max_idle_conns == 5   # default value
-    
-    def test_config_with_dsn(self):
-        """Test Config with DSN."""
-        dsn = "postgresql://user:pass@localhost:5432/dbname"
-        config = Config(dsn=dsn)
-        
-        assert config.dsn == dsn
-    
-    def test_tx_options_creation(self):
-        """Test TxOptions dataclass creation."""
-        timeout = datetime.timedelta(minutes=5)
-        options = TxOptions(
-            isolation=IsolationLevel.SERIALIZABLE,
-            read_only=True,
-            timeout=timeout
-        )
-        
-        assert options.isolation == IsolationLevel.SERIALIZABLE
-        assert options.read_only is True
-        assert options.timeout == timeout
-    
-    def test_tx_options_defaults(self):
-        """Test TxOptions default values."""
-        options = TxOptions()
-        
-        assert options.isolation == IsolationLevel.READ_COMMITTED
-        assert options.read_only is False
-        assert options.timeout is None
-    
-    def test_storage_info_creation(self):
-        """Test StorageInfo dataclass creation."""
-        info = StorageInfo(
-            name="PostgreSQL",
-            version="1.0.0",
-            database_type=DatabaseType.POSTGRESQL,
-            features=["transactions", "joins"]
-        )
-        
-        assert info.name == "PostgreSQL"
-        assert info.version == "1.0.0"
-        assert info.database_type == DatabaseType.POSTGRESQL
-        assert info.features == ["transactions", "joins"]
-        assert info.limits is None
-    
-    def test_health_status_creation(self):
-        """Test HealthStatus dataclass creation."""
-        now = datetime.datetime.now()
-        status = HealthStatus(
-            status=HealthStatusType.HEALTHY,
-            message="All systems operational",
-            timestamp=now,
-            details={"connections": 10}
-        )
-        
-        assert status.status == HealthStatusType.HEALTHY
-        assert status.message == "All systems operational"
-        assert status.timestamp == now
-        assert status.details == {"connections": 10}
-    
-    def test_health_status_default_timestamp(self):
-        """Test HealthStatus with default timestamp."""
-        status = HealthStatus(
-            status=HealthStatusType.HEALTHY,
-            message="OK"
-        )
-        
-        assert status.status == HealthStatusType.HEALTHY
-        assert status.message == "OK"
-        assert isinstance(status.timestamp, datetime.datetime)
-        assert status.details == {}
-    
-    def test_table_schema_creation(self):
-        """Test TableSchema dataclass creation."""
-        schema = TableSchema(
-            name="users",
-            columns=[],
-            indexes=[],
-            primary_key=["id"],
-            foreign_keys={"department_id": "departments.id"}
-        )
-        
-        assert schema.name == "users"
-        assert schema.columns == []
-        assert schema.indexes == []
-        assert schema.primary_key == ["id"]
-        assert schema.foreign_keys == {"department_id": "departments.id"}
+def test_config_defaults() -> None:
+    config = Config()
+
+    assert config.host == "localhost"
+    assert config.port is None  # the adapter supplies 5432 / 27017
+    assert config.connect_timeout == datetime.timedelta(seconds=10)
+    assert config.query_timeout == datetime.timedelta(seconds=30)
+    assert config.tx_timeout == datetime.timedelta(minutes=5)
+    assert config.max_idle_conns <= config.max_open_conns
 
 
-class TestDataClassFields:
-    """Test that dataclasses have expected fields."""
-    
-    def test_query_fields(self):
-        """Test Query dataclass fields."""
-        field_names = {field.name for field in fields(Query)}
-        expected_fields = {
-            "sql", "parameters", "query_type", "timeout", 
-            "cache_key", "cache_ttl", "read_only"
-        }
-        assert field_names == expected_fields
-    
-    def test_command_fields(self):
-        """Test Command dataclass fields."""
-        field_names = {field.name for field in fields(Command)}
-        expected_fields = {
-            "sql", "parameters", "command_type", "timeout",
-            "return_id", "return_count", "on_conflict"
-        }
-        assert field_names == expected_fields
-    
-    def test_config_fields(self):
-        """Test Config dataclass fields."""
-        field_names = {field.name for field in fields(Config)}
-        expected_fields = {
-            "host", "port", "database", "username", "password", "dsn",
-            "max_open_conns", "max_idle_conns", "conn_max_lifetime", "conn_max_idle_time",
-            "connect_timeout", "query_timeout", "tx_timeout",
-            "ssl_mode", "ssl_cert", "ssl_key", "ssl_root_ca", "options"
-        }
-        assert field_names == expected_fields
+def test_config_repr_redacts_password_and_dsn() -> None:
+    config = Config(
+        host="db.internal",
+        username="app",
+        password="hunter2",
+        dsn="postgresql://app:hunter2@db.internal/app",
+    )
+
+    text = repr(config)
+
+    assert "hunter2" not in text
+    assert "postgresql://" not in text
+    assert "host='db.internal'" in text
+    assert "username='app'" in text
 
 
-class TestTypeValidation:
-    """Test type validation and constraints."""
-    
-    def test_condition_field_required(self):
-        """Test that Condition requires field."""
-        # This should work
-        condition = Condition(field="test", operator=Operator.EQUAL)
-        assert condition.field == "test"
-    
-    def test_query_sql_required(self):
-        """Test that Query requires SQL."""
-        # This should work
-        query = Query(sql="SELECT 1")
-        assert query.sql == "SELECT 1"
-    
-    def test_command_sql_required(self):
-        """Test that Command requires SQL."""
-        # This should work
-        command = Command(sql="INSERT INTO test VALUES (?)")
-        assert command.sql == "INSERT INTO test VALUES (?)"
-    
-    def test_execute_result_rows_affected_required(self):
-        """Test that ExecuteResult requires rows_affected."""
-        # This should work
-        result = ExecuteResult(rows_affected=1)
-        assert result.rows_affected == 1
+def test_config_redaction_does_not_affect_equality() -> None:
+    assert Config(password="a") != Config(password="b")
+    assert Config(dsn="postgresql://a") != Config(dsn="postgresql://b")
+
+
+@pytest.mark.parametrize(
+    ("make", "attribute"),
+    [
+        (Config, "options"),
+        (Query, "parameters"),
+        (Command, "parameters"),
+        (QuerySpec, "where"),
+        (lambda: CommandSpec("users"), "values"),
+        (lambda: Condition("", Operator.AND), "conditions"),
+        (lambda: TableSchema("users"), "columns"),
+        (lambda: HealthStatus(HealthStatusType.HEALTHY, "ok"), "details"),
+    ],
+)
+def test_mutable_defaults_are_not_shared(
+    make: Callable[[], Any], attribute: str
+) -> None:
+    assert getattr(make(), attribute) is not getattr(make(), attribute)
+
+
+# Queries and commands
+
+
+def test_query_can_carry_only_a_spec() -> None:
+    spec = QuerySpec(
+        table="users",
+        where=[Condition("age", Operator.GREATER_THAN, 30)],
+        order_by=[OrderBy("name")],
+        limit=10,
+    )
+
+    query = Query(spec=spec)
+
+    assert query.sql == ""
+    assert query.parameters == []
+    assert query.query_type is QueryType.UNKNOWN
+    assert query.timeout is None  # falls back to Config.query_timeout
+    assert query.spec is spec
+
+
+def test_raw_sql_has_no_spec() -> None:
+    assert Query("SELECT 1").spec is None
+    assert Command("DELETE FROM users").spec is None
+
+
+def test_query_spec_uses_no_sql_only_feature_by_default() -> None:
+    spec = QuerySpec(table="users")
+
+    assert spec.fields == []  # all fields
+    assert spec.joins == []
+    assert spec.group_by == []
+    assert spec.having == []
+    assert spec.subquery is False
+
+
+@pytest.mark.parametrize(
+    ("make", "option"),
+    [
+        (Query, "cache_key"),
+        (Query, "cache_ttl"),
+        (Query, "read_only"),
+        (Command, "return_id"),
+        (Command, "return_count"),
+        (Command, "on_conflict"),
+    ],
+)
+def test_unimplemented_options_are_rejected(
+    make: type[Query] | type[Command], option: str
+) -> None:
+    kwargs: dict[str, Any] = {option: True}
+
+    with pytest.raises(TypeError, match=option):
+        make("SELECT 1", **kwargs)
+
+
+def test_column_ref_is_a_frozen_value_distinct_from_strings() -> None:
+    ref = ColumnRef("b.a_id")
+    literal: object = "b.a_id"
+
+    assert ref == ColumnRef("b.a_id")
+    assert hash(ref) == hash(ColumnRef("b.a_id"))
+    assert ref != literal
+    assert not isinstance(ref, str)
+    with pytest.raises(dataclasses.FrozenInstanceError):
+        ref.name = "other"  # type: ignore[misc]
+
+
+def test_defaults_of_join_order_by_and_execute_result() -> None:
+    assert Join(JoinType.CROSS, "b").on is None
+    assert OrderBy("name").direction is SortDirection.ASC
+    assert ExecuteResult(rows_affected=3).last_insert_id is None
+
+
+def test_tx_options_default_to_the_database_defaults() -> None:
+    options = TxOptions()
+
+    assert options.isolation is IsolationLevel.DEFAULT
+    assert options.read_only is False
+    assert options.timeout is None  # falls back to Config.tx_timeout
+
+
+def test_health_status_timestamp_is_timezone_aware() -> None:
+    before = datetime.datetime.now(datetime.UTC)
+
+    status = HealthStatus(HealthStatusType.HEALTHY, "ok")
+
+    # Comparing with an aware datetime would raise TypeError for a naive one.
+    assert before <= status.timestamp <= datetime.datetime.now(datetime.UTC)
+    assert status.timestamp.utcoffset() == datetime.timedelta(0)
+
+
+ENUMS = [
+    obj
+    for obj in vars(storage_types).values()
+    if isinstance(obj, type)
+    and issubclass(obj, enum.Enum)
+    and obj.__module__ == storage_types.__name__
+]
+
+
+@pytest.mark.parametrize("enum_class", ENUMS, ids=lambda cls: cls.__name__)
+def test_enum_values_are_unique(enum_class: type[enum.Enum]) -> None:
+    # A duplicated value would silently make a member an alias of another.
+    assert len(enum_class.__members__) == len(list(enum_class))
+
+
+@pytest.mark.parametrize(
+    ("module", "name"),
+    [
+        (storage_types, "Row"),
+        (storage_types, "Rows"),
+        (storage_types, "ParameterValue"),
+        (storage_types, "Parameters"),
+        (storage_types, "ConflictResolution"),
+        (storage_interfaces, "HealthChecker"),
+    ],
+)
+def test_removed_names_are_gone(module: object, name: str) -> None:
+    assert not hasattr(module, name)
+
+
+def test_package_exports_the_contract() -> None:
+    assert [name for name in storage.__all__ if not hasattr(storage, name)] == []
+    assert storage.Row is storage_interfaces.Row
+
+
+# Interfaces
+
+
+@pytest.mark.parametrize("interface", [Row, Result, Transaction, Storage, Adapter])
+def test_interfaces_cannot_be_instantiated(interface: type[Any]) -> None:
+    with pytest.raises(TypeError, match="abstract"):
+        interface()
+
+
+@pytest.mark.parametrize(
+    ("interface", "methods"),
+    [
+        (
+            Storage,
+            {
+                "connect",
+                "close",
+                "ping",
+                "health",
+                "query",
+                "query_one",
+                "execute",
+                "begin_tx",
+                "batch",
+                "create_table",
+                "drop_table",
+                "alter_table",
+                "info",
+                "list_tables",
+                "describe_table",
+            },
+        ),
+        (
+            Transaction,
+            {
+                "query",
+                "query_one",
+                "execute",
+                "batch",
+                "commit",
+                "rollback",
+                "savepoint",
+                "rollback_to_savepoint",
+                "is_active",
+                "get_id",
+            },
+        ),
+        (
+            Adapter,
+            {
+                "name",
+                "version",
+                "database_type",
+                "connect",
+                "parse_dsn",
+                "validate_config",
+                "translate_query",
+                "translate_command",
+                "map_python_type",
+                "map_database_type",
+                "supports_transactions",
+                "supports_joins",
+                "supports_batch",
+                "supports_schema",
+            },
+        ),
+    ],
+)
+def test_interfaces_mirror_the_go_contract(
+    interface: type[Any], methods: set[str]
+) -> None:
+    assert interface.__abstractmethods__ == methods
+
+
+# Transaction context manager
+
+
+class FakeTransaction(Transaction):
+    """Records control calls; commit and rollback end the transaction."""
+
+    def __init__(
+        self,
+        commit_error: BaseException | None = None,
+        failed_commit_ends: bool = False,
+    ) -> None:
+        self.calls: list[str] = []
+        self.active = False
+        self.commit_error = commit_error
+        self.failed_commit_ends = failed_commit_ends
+
+    async def begin(self) -> None:
+        self.calls.append("begin")
+        self.active = True
+
+    async def commit(self) -> None:
+        self.calls.append("commit")
+        if self.commit_error is not None:
+            self.active = not self.failed_commit_ends
+            raise self.commit_error
+        self.active = False
+
+    async def rollback(self) -> None:
+        self.calls.append("rollback")
+        self.active = False
+
+    def is_active(self) -> bool:
+        return self.active
+
+    def get_id(self) -> str:
+        return "tx-1"
+
+    async def query(self, query: Query) -> Result:
+        raise NotImplementedError
+
+    async def query_one(self, query: Query) -> Row | None:
+        raise NotImplementedError
+
+    async def execute(self, command: Command) -> ExecuteResult:
+        raise NotImplementedError
+
+    async def batch(self, operations: list[Operation]) -> list[OperationResult]:
+        raise NotImplementedError
+
+    async def savepoint(self, name: str) -> None:
+        raise NotImplementedError
+
+    async def rollback_to_savepoint(self, name: str) -> None:
+        raise NotImplementedError
+
+
+async def begin_tx(
+    commit_error: BaseException | None = None, failed_commit_ends: bool = False
+) -> FakeTransaction:
+    """Like Storage.begin_tx: the transaction is begun exactly once, here."""
+    tx = FakeTransaction(commit_error, failed_commit_ends)
+    await tx.begin()
+    return tx
+
+
+async def raise_inside(tx: Transaction, error: BaseException) -> None:
+    async with tx:
+        raise error
+
+
+async def complete_inside(tx: Transaction) -> None:
+    async with tx:
+        pass
+
+
+async def test_entering_does_not_begin_again_and_success_commits() -> None:
+    async with await begin_tx() as tx:
+        assert tx.calls == ["begin"]
+
+    assert tx.calls == ["begin", "commit"]
+    assert not tx.is_active()
+
+
+async def test_entering_returns_the_transaction() -> None:
+    tx = await begin_tx()
+
+    async with tx as entered:
+        assert entered is tx
+
+
+async def test_exception_rolls_back_and_propagates() -> None:
+    tx = await begin_tx()
+
+    with pytest.raises(LookupError):
+        await raise_inside(tx, LookupError("missing"))
+
+    assert tx.calls == ["begin", "rollback"]
+
+
+async def test_cancellation_rolls_back() -> None:
+    tx = await begin_tx()
+
+    with pytest.raises(asyncio.CancelledError):
+        await raise_inside(tx, asyncio.CancelledError())
+
+    assert tx.calls == ["begin", "rollback"]
+
+
+@pytest.mark.parametrize("action", ["commit", "rollback"])
+async def test_ending_inside_the_block_is_not_repeated_on_exit(action: str) -> None:
+    async with await begin_tx() as tx:
+        await getattr(tx, action)()
+
+    assert tx.calls == ["begin", action]
+
+
+@pytest.mark.parametrize(
+    ("failed_commit_ends", "calls"),
+    [
+        (False, ["begin", "commit", "rollback"]),
+        # e.g. PostgreSQL ends a transaction whose COMMIT failed
+        (True, ["begin", "commit"]),
+    ],
+)
+async def test_failed_commit_leaves_no_open_transaction_and_raises_its_error(
+    failed_commit_ends: bool, calls: list[str]
+) -> None:
+    error = TransactionFailedError("serialization failure")
+    tx = await begin_tx(commit_error=error, failed_commit_ends=failed_commit_ends)
+
+    with pytest.raises(TransactionFailedError) as excinfo:
+        await complete_inside(tx)
+
+    assert excinfo.value is error
+    assert tx.calls == calls
+    assert not tx.is_active()
+
+
+def test_context_manager_is_implemented_once_for_all_adapters() -> None:
+    assert getattr(Transaction.__aenter__, "__final__", False) is True
+    assert getattr(Transaction.__aexit__, "__final__", False) is True

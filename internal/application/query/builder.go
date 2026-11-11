@@ -1,131 +1,136 @@
-// Package query provides a fluent query builder for database-agnostic queries
+// Package query provides a fluent query builder for database-agnostic queries.
+//
+// Builders render SQL with '?' placeholders (adapters translate them to the
+// database's native form) together with the equivalent structured Spec used by
+// document adapters. Values are always bound as parameters unless wrapped with
+// Col; identifiers (tables, columns, aliases) are validated against a strict
+// pattern, and invalid input makes Build return a domain.ErrInvalidQuery error.
 package query
 
 import (
 	"fmt"
+	"maps"
+	"math"
+	"slices"
+	"strconv"
 	"strings"
 
 	"github.com/AnandSGit/HybridCache.io/internal/domain"
 )
 
-// Builder implements the QueryBuilder interface
+// Builder implements the domain.QueryBuilder interface for SELECT queries.
+//
+// Setters only record state (an invalid pagination or subquery argument is kept
+// and reported by Build); Build validates and renders it without modifying the
+// builder, so Build and BuildRaw can be called repeatedly with identical results.
 type Builder struct {
-	selectFields    []string
-	distinct        bool
-	fromTable       string
-	fromSubquery    *Builder
-	fromAlias       string
-	whereConditions []domain.Condition
-	joinClauses     []joinClause
-	groupByFields   []string
-	havingCondition *domain.Condition
-	orderByFields   []orderByField
-	limitValue      *int
-	offsetValue     *int
-	queryType       domain.QueryType
-	parameters      []interface{}
-	paramIndex      int
-}
-
-type joinClause struct {
-	joinType domain.JoinType
-	table    string
-	on       domain.Condition
-}
-
-type orderByField struct {
-	field     string
-	direction domain.SortDirection
+	selectFields []string
+	distinct     bool
+	fromTable    string
+	fromSubquery *Builder
+	fromAlias    string
+	where        []domain.Condition
+	joins        []domain.Join
+	groupBy      []string
+	having       []domain.Condition
+	orderBy      []domain.OrderBy
+	limit        *int
+	offset       *int
+	err          error // first invalid argument passed to a setter
 }
 
 // NewBuilder creates a new query builder
 func NewBuilder() domain.QueryBuilder {
-	return &Builder{
-		selectFields:    make([]string, 0),
-		whereConditions: make([]domain.Condition, 0),
-		joinClauses:     make([]joinClause, 0),
-		groupByFields:   make([]string, 0),
-		orderByFields:   make([]orderByField, 0),
-		parameters:      make([]interface{}, 0),
-		queryType:       domain.QueryTypeSelect,
-	}
+	return &Builder{}
 }
 
-// Select adds fields to select
+// Select adds fields to select. Each field is an identifier (optionally
+// dot-qualified), "*", "t.*", or COUNT/SUM/AVG/MIN/MAX of an identifier or "*";
+// identifiers and aggregates may be followed by "AS alias". Selecting no fields
+// selects "*".
 func (b *Builder) Select(fields ...string) domain.QueryBuilder {
 	b.selectFields = append(b.selectFields, fields...)
-	b.queryType = domain.QueryTypeSelect
 	return b
 }
 
-// SelectDistinct adds distinct fields to select
+// SelectDistinct adds fields to select and makes the query SELECT DISTINCT
 func (b *Builder) SelectDistinct(fields ...string) domain.QueryBuilder {
 	b.selectFields = append(b.selectFields, fields...)
 	b.distinct = true
-	b.queryType = domain.QueryTypeSelect
 	return b
 }
 
-// SelectCount adds a count field
+// SelectCount adds COUNT(field), or COUNT(*) when field is empty
 func (b *Builder) SelectCount(field string) domain.QueryBuilder {
 	if field == "" {
 		field = "*"
 	}
-	b.selectFields = append(b.selectFields, fmt.Sprintf("COUNT(%s)", field))
-	b.queryType = domain.QueryTypeSelect
+	b.selectFields = append(b.selectFields, "COUNT("+field+")")
 	return b
 }
 
-// From sets the table to select from
+// From sets the table to select from, optionally with an alias ("users u" or
+// "users AS u"). It replaces a data source set earlier.
 func (b *Builder) From(table string) domain.QueryBuilder {
 	b.fromTable = table
+	b.fromSubquery = nil
+	b.fromAlias = ""
 	return b
 }
 
-// FromSubquery sets a subquery as the data source
+// FromSubquery sets a subquery created by NewBuilder as the data source, under
+// the given alias. It replaces a data source set earlier; any other subquery
+// value makes Build fail.
 func (b *Builder) FromSubquery(subquery domain.QueryBuilder, alias string) domain.QueryBuilder {
-	if sb, ok := subquery.(*Builder); ok {
-		b.fromSubquery = sb
-		b.fromAlias = alias
+	sb, ok := subquery.(*Builder)
+	if !ok || sb == nil {
+		b.setErr(domain.NewInvalidQueryError(fmt.Sprintf("subquery must be a non-nil *query.Builder, got %T", subquery)))
+		return b
 	}
+	b.fromTable = ""
+	b.fromSubquery = sb
+	b.fromAlias = alias
 	return b
 }
 
-// Where adds a where condition
+// Where adds a condition; Where and WhereAnd conditions are combined with AND
 func (b *Builder) Where(condition domain.Condition) domain.QueryBuilder {
-	b.whereConditions = append(b.whereConditions, condition)
+	b.where = append(b.where, condition)
 	return b
 }
 
-// WhereAnd adds multiple AND conditions
+// WhereAnd adds conditions that are combined with AND
 func (b *Builder) WhereAnd(conditions ...domain.Condition) domain.QueryBuilder {
-	b.whereConditions = append(b.whereConditions, conditions...)
+	b.where = append(b.where, conditions...)
 	return b
 }
 
-// WhereOr adds multiple OR conditions (combined as a single OR group)
+// WhereOr adds a single parenthesised group "(c1 OR c2 ...)", combined with the
+// other WHERE conditions using AND. It is a no-op without conditions.
 func (b *Builder) WhereOr(conditions ...domain.Condition) domain.QueryBuilder {
-	// For OR conditions, we need to group them properly
-	// This is a simplified implementation - in practice, you'd want more sophisticated grouping
-	for _, condition := range conditions {
-		b.whereConditions = append(b.whereConditions, condition)
+	if len(conditions) == 0 {
+		return b
 	}
+	b.where = append(b.where, Or(slices.Clone(conditions)...))
 	return b
 }
 
-// Having adds a having condition
+// Having adds a HAVING condition; multiple conditions are combined with AND
 func (b *Builder) Having(condition domain.Condition) domain.QueryBuilder {
-	b.havingCondition = &condition
+	b.having = append(b.having, condition)
 	return b
 }
 
-// Join adds a join clause
+// Join adds a join. The table may carry an alias ("orders o" or "orders AS o").
+// Compare columns in on with Col, e.g. Equal("o.user_id", Col("u.id")): plain
+// values are bound as parameters. on is ignored for domain.JoinTypeCross, which
+// has no ON clause.
 func (b *Builder) Join(joinType domain.JoinType, table string, on domain.Condition) domain.QueryBuilder {
-	b.joinClauses = append(b.joinClauses, joinClause{
-		joinType: joinType,
-		table:    table,
-		on:       on,
-	})
+	join := domain.Join{Type: joinType, Table: table}
+	if joinType != domain.JoinTypeCross {
+		join.On = &on
+	}
+	b.joins = append(b.joins, join)
 	return b
 }
 
@@ -146,16 +151,13 @@ func (b *Builder) InnerJoin(table string, on domain.Condition) domain.QueryBuild
 
 // GroupBy adds group by fields
 func (b *Builder) GroupBy(fields ...string) domain.QueryBuilder {
-	b.groupByFields = append(b.groupByFields, fields...)
+	b.groupBy = append(b.groupBy, fields...)
 	return b
 }
 
 // OrderBy adds an order by field
 func (b *Builder) OrderBy(field string, direction domain.SortDirection) domain.QueryBuilder {
-	b.orderByFields = append(b.orderByFields, orderByField{
-		field:     field,
-		direction: direction,
-	})
+	b.orderBy = append(b.orderBy, domain.OrderBy{Field: field, Direction: direction})
 	return b
 }
 
@@ -169,545 +171,391 @@ func (b *Builder) OrderByAsc(field string) domain.QueryBuilder {
 	return b.OrderBy(field, domain.SortDirectionAsc)
 }
 
-// Limit sets the limit
+// Limit sets the limit; a negative limit makes Build fail
 func (b *Builder) Limit(limit int) domain.QueryBuilder {
-	b.limitValue = &limit
+	if limit < 0 {
+		b.setErr(domain.NewInvalidQueryError("limit must not be negative").WithContext("limit", limit))
+		return b
+	}
+	b.limit = &limit
 	return b
 }
 
-// Offset sets the offset
+// Offset sets the offset; a negative offset makes Build fail
 func (b *Builder) Offset(offset int) domain.QueryBuilder {
-	b.offsetValue = &offset
+	if offset < 0 {
+		b.setErr(domain.NewInvalidQueryError("offset must not be negative").WithContext("offset", offset))
+		return b
+	}
+	b.offset = &offset
 	return b
 }
 
-// Page sets pagination (page is 1-based)
+// Page sets LIMIT size and OFFSET (page-1)*size. page is 1-based; a page or size
+// below 1 makes Build fail.
 func (b *Builder) Page(page, size int) domain.QueryBuilder {
-	if page < 1 {
-		page = 1
+	if page < 1 || size < 1 {
+		b.setErr(domain.NewInvalidQueryError("page and page size must be at least 1").
+			WithContext("page", page).WithContext("size", size))
+		return b
+	}
+	if page-1 > math.MaxInt/size {
+		b.setErr(domain.NewInvalidQueryError("page offset overflows int").
+			WithContext("page", page).WithContext("size", size))
+		return b
 	}
 	offset := (page - 1) * size
-	b.limitValue = &size
-	b.offsetValue = &offset
+	b.limit = &size
+	b.offset = &offset
 	return b
 }
 
-// Build builds the query
+func (b *Builder) setErr(err error) {
+	if b.err == nil {
+		b.err = err
+	}
+}
+
+// Build builds the query: SQL with '?' placeholders, its parameters, and the
+// structured Spec mirroring the SQL. Spec.Table is the bare table name (without
+// alias) and is empty for FromSubquery, which sets Spec.Subquery instead.
 func (b *Builder) Build() (domain.Query, error) {
-	sql, params, err := b.BuildRaw()
+	sql, params, spec, err := b.build()
 	if err != nil {
 		return domain.Query{}, err
 	}
-
 	return domain.Query{
 		SQL:        sql,
 		Parameters: params,
-		Type:       b.queryType,
-		Options:    domain.QueryOptions{},
+		Type:       domain.QueryTypeSelect,
+		Spec:       spec,
 	}, nil
 }
 
 // BuildRaw builds the raw SQL and parameters
 func (b *Builder) BuildRaw() (string, []interface{}, error) {
+	sql, params, _, err := b.build()
+	return sql, params, err
+}
+
+func (b *Builder) build() (string, []interface{}, *domain.QuerySpec, error) {
+	if b.err != nil {
+		return "", nil, nil, b.err
+	}
+
+	var r renderer
 	var parts []string
-	var params []interface{}
+	spec := &domain.QuerySpec{Distinct: b.distinct}
 
 	// SELECT clause
-	if len(b.selectFields) == 0 {
-		b.selectFields = []string{"*"}
+	for _, field := range b.selectFields {
+		if err := checkIdentifier(selectPattern, "select expression", field); err != nil {
+			return "", nil, nil, err
+		}
 	}
-
-	selectClause := "SELECT "
+	selectList := "*"
+	if len(b.selectFields) > 0 {
+		selectList = strings.Join(b.selectFields, ", ")
+	}
+	if selectList != "*" {
+		spec.Fields = slices.Clone(b.selectFields)
+	}
 	if b.distinct {
-		selectClause += "DISTINCT "
+		parts = append(parts, "SELECT DISTINCT "+selectList)
+	} else {
+		parts = append(parts, "SELECT "+selectList)
 	}
-	selectClause += strings.Join(b.selectFields, ", ")
-	parts = append(parts, selectClause)
 
 	// FROM clause
-	if b.fromTable != "" {
-		parts = append(parts, "FROM "+b.fromTable)
-	} else if b.fromSubquery != nil {
-		subSQL, subParams, err := b.fromSubquery.BuildRaw()
-		if err != nil {
-			return "", nil, fmt.Errorf("failed to build subquery: %w", err)
+	switch {
+	case b.fromSubquery != nil:
+		if err := checkIdentifier(aliasPattern, "subquery alias", b.fromAlias); err != nil {
+			return "", nil, nil, err
 		}
-		parts = append(parts, fmt.Sprintf("FROM (%s) AS %s", subSQL, b.fromAlias))
-		params = append(params, subParams...)
-	} else {
-		return "", nil, fmt.Errorf("no table or subquery specified")
+		subSQL, err := r.subquery(b.fromSubquery)
+		if err != nil {
+			return "", nil, nil, err
+		}
+		parts = append(parts, "FROM "+subSQL+" AS "+b.fromAlias)
+		spec.Subquery = true
+	case b.fromTable != "":
+		table, err := tableName(b.fromTable)
+		if err != nil {
+			return "", nil, nil, err
+		}
+		parts = append(parts, "FROM "+b.fromTable)
+		spec.Table = table
+	default:
+		return "", nil, nil, domain.NewInvalidQueryError("no table or subquery specified")
 	}
 
 	// JOIN clauses
-	for _, join := range b.joinClauses {
-		joinSQL, joinParams := b.buildJoinClause(join)
+	for _, join := range b.joins {
+		joinSQL, err := r.join(join)
+		if err != nil {
+			return "", nil, nil, err
+		}
 		parts = append(parts, joinSQL)
-		params = append(params, joinParams...)
 	}
+	spec.Joins = cloneJoins(b.joins)
 
 	// WHERE clause
-	if len(b.whereConditions) > 0 {
-		whereSQL, whereParams := b.buildWhereClause(b.whereConditions)
+	if len(b.where) > 0 {
+		whereSQL, err := r.conditions(b.where, " AND ")
+		if err != nil {
+			return "", nil, nil, err
+		}
 		parts = append(parts, "WHERE "+whereSQL)
-		params = append(params, whereParams...)
+		spec.Where = cloneConditions(b.where)
 	}
 
 	// GROUP BY clause
-	if len(b.groupByFields) > 0 {
-		parts = append(parts, "GROUP BY "+strings.Join(b.groupByFields, ", "))
+	if len(b.groupBy) > 0 {
+		for _, field := range b.groupBy {
+			if err := checkIdentifier(identifierPattern, "GROUP BY field", field); err != nil {
+				return "", nil, nil, err
+			}
+		}
+		parts = append(parts, "GROUP BY "+strings.Join(b.groupBy, ", "))
+		spec.GroupBy = slices.Clone(b.groupBy)
 	}
 
 	// HAVING clause
-	if b.havingCondition != nil {
-		havingSQL, havingParams := b.buildCondition(*b.havingCondition)
+	if len(b.having) > 0 {
+		havingSQL, err := r.conditions(b.having, " AND ")
+		if err != nil {
+			return "", nil, nil, err
+		}
 		parts = append(parts, "HAVING "+havingSQL)
-		params = append(params, havingParams...)
+		spec.Having = cloneConditions(b.having)
 	}
 
 	// ORDER BY clause
-	if len(b.orderByFields) > 0 {
-		var orderParts []string
-		for _, order := range b.orderByFields {
-			direction := "ASC"
-			if order.direction == domain.SortDirectionDesc {
-				direction = "DESC"
+	if len(b.orderBy) > 0 {
+		terms := make([]string, len(b.orderBy))
+		for i, order := range b.orderBy {
+			if err := checkIdentifier(identifierPattern, "ORDER BY field", order.Field); err != nil {
+				return "", nil, nil, err
 			}
-			orderParts = append(orderParts, fmt.Sprintf("%s %s", order.field, direction))
+			var direction string
+			switch order.Direction {
+			case domain.SortDirectionAsc:
+				direction = "ASC"
+			case domain.SortDirectionDesc:
+				direction = "DESC"
+			default:
+				return "", nil, nil, domain.NewInvalidQueryError(fmt.Sprintf("unknown sort direction %d", order.Direction))
+			}
+			terms[i] = order.Field + " " + direction
 		}
-		parts = append(parts, "ORDER BY "+strings.Join(orderParts, ", "))
+		parts = append(parts, "ORDER BY "+strings.Join(terms, ", "))
+		spec.OrderBy = slices.Clone(b.orderBy)
 	}
 
-	// LIMIT clause
-	if b.limitValue != nil {
-		parts = append(parts, fmt.Sprintf("LIMIT %d", *b.limitValue))
+	// LIMIT / OFFSET clauses
+	if b.limit != nil {
+		limit := *b.limit
+		parts = append(parts, "LIMIT "+strconv.Itoa(limit))
+		spec.Limit = &limit
+	}
+	if b.offset != nil {
+		offset := *b.offset
+		parts = append(parts, "OFFSET "+strconv.Itoa(offset))
+		spec.Offset = &offset
 	}
 
-	// OFFSET clause
-	if b.offsetValue != nil {
-		parts = append(parts, fmt.Sprintf("OFFSET %d", *b.offsetValue))
-	}
-
-	return strings.Join(parts, " "), params, nil
+	return strings.Join(parts, " "), r.params, spec, nil
 }
 
-// buildJoinClause builds a JOIN clause
-func (b *Builder) buildJoinClause(join joinClause) (string, []interface{}) {
-	var joinType string
-	switch join.joinType {
-	case domain.JoinTypeInner:
-		joinType = "INNER JOIN"
-	case domain.JoinTypeLeft:
-		joinType = "LEFT JOIN"
-	case domain.JoinTypeRight:
-		joinType = "RIGHT JOIN"
-	case domain.JoinTypeFull:
-		joinType = "FULL OUTER JOIN"
-	case domain.JoinTypeCross:
-		joinType = "CROSS JOIN"
-	default:
-		joinType = "INNER JOIN"
-	}
-
-	onSQL, onParams := b.buildCondition(join.on)
-	return fmt.Sprintf("%s %s ON %s", joinType, join.table, onSQL), onParams
+// joinKeywords maps every supported join type to its SQL keyword.
+var joinKeywords = map[domain.JoinType]string{
+	domain.JoinTypeInner: "INNER JOIN",
+	domain.JoinTypeLeft:  "LEFT JOIN",
+	domain.JoinTypeRight: "RIGHT JOIN",
+	domain.JoinTypeFull:  "FULL OUTER JOIN",
+	domain.JoinTypeCross: "CROSS JOIN",
 }
 
-// buildWhereClause builds the WHERE clause
-func (b *Builder) buildWhereClause(conditions []domain.Condition) (string, []interface{}) {
-	if len(conditions) == 0 {
-		return "", nil
+// join renders a JOIN clause; CROSS JOIN has no ON clause.
+func (r *renderer) join(join domain.Join) (string, error) {
+	keyword, ok := joinKeywords[join.Type]
+	if !ok {
+		return "", domain.NewInvalidQueryError(fmt.Sprintf("unknown join type %d", join.Type))
 	}
+	if _, err := tableName(join.Table); err != nil {
+		return "", err
+	}
+	if join.On == nil {
+		return keyword + " " + join.Table, nil
+	}
+	onSQL, err := r.condition(*join.On)
+	if err != nil {
+		return "", err
+	}
+	return keyword + " " + join.Table + " ON " + onSQL, nil
+}
 
-	var parts []string
-	var params []interface{}
-
-	for i, condition := range conditions {
-		condSQL, condParams := b.buildCondition(condition)
-		if i > 0 {
-			parts = append(parts, "AND")
+// cloneJoins deep-copies joins so that a built Spec does not share state with
+// the builder.
+func cloneJoins(joins []domain.Join) []domain.Join {
+	if len(joins) == 0 {
+		return nil
+	}
+	out := make([]domain.Join, len(joins))
+	for i, join := range joins {
+		if join.On != nil {
+			on := cloneCondition(*join.On)
+			join.On = &on
 		}
-		parts = append(parts, condSQL)
-		params = append(params, condParams...)
+		out[i] = join
 	}
-
-	return strings.Join(parts, " "), params
+	return out
 }
 
-// buildCondition builds a single condition
-func (b *Builder) buildCondition(condition domain.Condition) (string, []interface{}) {
-	switch condition.Operator {
-	case domain.OperatorEqual:
-		return fmt.Sprintf("%s = ?", condition.Field), []interface{}{condition.Value}
-	case domain.OperatorNotEqual:
-		return fmt.Sprintf("%s != ?", condition.Field), []interface{}{condition.Value}
-	case domain.OperatorGreaterThan:
-		return fmt.Sprintf("%s > ?", condition.Field), []interface{}{condition.Value}
-	case domain.OperatorGreaterThanOrEqual:
-		return fmt.Sprintf("%s >= ?", condition.Field), []interface{}{condition.Value}
-	case domain.OperatorLessThan:
-		return fmt.Sprintf("%s < ?", condition.Field), []interface{}{condition.Value}
-	case domain.OperatorLessThanOrEqual:
-		return fmt.Sprintf("%s <= ?", condition.Field), []interface{}{condition.Value}
-	case domain.OperatorLike:
-		return fmt.Sprintf("%s LIKE ?", condition.Field), []interface{}{condition.Value}
-	case domain.OperatorNotLike:
-		return fmt.Sprintf("%s NOT LIKE ?", condition.Field), []interface{}{condition.Value}
-	case domain.OperatorIn:
-		if len(condition.Values) == 0 {
-			return "1=0", nil // No values means no match
-		}
-		placeholders := strings.Repeat("?,", len(condition.Values))
-		placeholders = placeholders[:len(placeholders)-1] // Remove trailing comma
-		return fmt.Sprintf("%s IN (%s)", condition.Field, placeholders), condition.Values
-	case domain.OperatorNotIn:
-		if len(condition.Values) == 0 {
-			return "1=1", nil // No values means all match
-		}
-		placeholders := strings.Repeat("?,", len(condition.Values))
-		placeholders = placeholders[:len(placeholders)-1] // Remove trailing comma
-		return fmt.Sprintf("%s NOT IN (%s)", condition.Field, placeholders), condition.Values
-	case domain.OperatorBetween:
-		if len(condition.Values) >= 2 {
-			return fmt.Sprintf("%s BETWEEN ? AND ?", condition.Field), condition.Values[:2]
-		}
-		return fmt.Sprintf("%s BETWEEN ? AND ?", condition.Field), []interface{}{condition.Value, condition.Value}
-	case domain.OperatorNotBetween:
-		if len(condition.Values) >= 2 {
-			return fmt.Sprintf("%s NOT BETWEEN ? AND ?", condition.Field), condition.Values[:2]
-		}
-		return fmt.Sprintf("%s NOT BETWEEN ? AND ?", condition.Field), []interface{}{condition.Value, condition.Value}
-	case domain.OperatorIsNull:
-		return fmt.Sprintf("%s IS NULL", condition.Field), nil
-	case domain.OperatorIsNotNull:
-		return fmt.Sprintf("%s IS NOT NULL", condition.Field), nil
-	case domain.OperatorExists:
-		return fmt.Sprintf("EXISTS (%s)", condition.Value), nil
-	case domain.OperatorNotExists:
-		return fmt.Sprintf("NOT EXISTS (%s)", condition.Value), nil
-	default:
-		return fmt.Sprintf("%s = ?", condition.Field), []interface{}{condition.Value}
-	}
-}
-
-// Helper functions for creating conditions
-func Equal(field string, value interface{}) domain.Condition {
-	return domain.Condition{
-		Field:    field,
-		Operator: domain.OperatorEqual,
-		Value:    value,
-	}
-}
-
-func NotEqual(field string, value interface{}) domain.Condition {
-	return domain.Condition{
-		Field:    field,
-		Operator: domain.OperatorNotEqual,
-		Value:    value,
-	}
-}
-
-func GreaterThan(field string, value interface{}) domain.Condition {
-	return domain.Condition{
-		Field:    field,
-		Operator: domain.OperatorGreaterThan,
-		Value:    value,
-	}
-}
-
-func LessThan(field string, value interface{}) domain.Condition {
-	return domain.Condition{
-		Field:    field,
-		Operator: domain.OperatorLessThan,
-		Value:    value,
-	}
-}
-
-func In(field string, values ...interface{}) domain.Condition {
-	return domain.Condition{
-		Field:    field,
-		Operator: domain.OperatorIn,
-		Values:   values,
-	}
-}
-
-func Like(field string, pattern string) domain.Condition {
-	return domain.Condition{
-		Field:    field,
-		Operator: domain.OperatorLike,
-		Value:    pattern,
-	}
-}
-
-func IsNull(field string) domain.Condition {
-	return domain.Condition{
-		Field:    field,
-		Operator: domain.OperatorIsNull,
-	}
-}
-
-func IsNotNull(field string) domain.Condition {
-	return domain.Condition{
-		Field:    field,
-		Operator: domain.OperatorIsNotNull,
-	}
-}
-
-// CommandBuilder provides a fluent API for building commands (INSERT, UPDATE, DELETE)
+// CommandBuilder provides a fluent API for building commands (INSERT, UPDATE,
+// DELETE). Create one with Insert, Update or Delete.
 type CommandBuilder struct {
-	commandType     domain.CommandType
-	table           string
-	values          map[string]interface{}
-	whereConditions []domain.Condition
-	parameters      []interface{}
-}
-
-// NewCommandBuilder creates a new command builder
-func NewCommandBuilder() *CommandBuilder {
-	return &CommandBuilder{
-		values:          make(map[string]interface{}),
-		whereConditions: make([]domain.Condition, 0),
-		parameters:      make([]interface{}, 0),
-	}
+	commandType domain.CommandType
+	table       string
+	values      []domain.FieldValue // in first-Set order
+	where       []domain.Condition
 }
 
 // Insert creates an INSERT command builder
 func Insert(table string) *CommandBuilder {
-	return &CommandBuilder{
-		commandType:     domain.CommandTypeInsert,
-		table:           table,
-		values:          make(map[string]interface{}),
-		whereConditions: make([]domain.Condition, 0),
-		parameters:      make([]interface{}, 0),
-	}
+	return &CommandBuilder{commandType: domain.CommandTypeInsert, table: table}
 }
 
 // Update creates an UPDATE command builder
 func Update(table string) *CommandBuilder {
-	return &CommandBuilder{
-		commandType:     domain.CommandTypeUpdate,
-		table:           table,
-		values:          make(map[string]interface{}),
-		whereConditions: make([]domain.Condition, 0),
-		parameters:      make([]interface{}, 0),
-	}
+	return &CommandBuilder{commandType: domain.CommandTypeUpdate, table: table}
 }
 
 // Delete creates a DELETE command builder
 func Delete(table string) *CommandBuilder {
-	return &CommandBuilder{
-		commandType:     domain.CommandTypeDelete,
-		table:           table,
-		values:          make(map[string]interface{}),
-		whereConditions: make([]domain.Condition, 0),
-		parameters:      make([]interface{}, 0),
-	}
+	return &CommandBuilder{commandType: domain.CommandTypeDelete, table: table}
 }
 
-// Set adds a field-value pair for INSERT or UPDATE
+// Set assigns a column value for INSERT or UPDATE. Columns are rendered in the
+// order they were first set; setting a column again replaces its value in place.
 func (cb *CommandBuilder) Set(field string, value interface{}) *CommandBuilder {
-	cb.values[field] = value
+	for i := range cb.values {
+		if cb.values[i].Field == field {
+			cb.values[i].Value = value
+			return cb
+		}
+	}
+	cb.values = append(cb.values, domain.FieldValue{Field: field, Value: value})
 	return cb
 }
 
-// Values sets multiple field-value pairs
+// Values sets multiple column values as Set does, taking the keys in sorted
+// order so that the generated SQL is deterministic.
 func (cb *CommandBuilder) Values(values map[string]interface{}) *CommandBuilder {
-	for field, value := range values {
-		cb.values[field] = value
+	for _, field := range slices.Sorted(maps.Keys(values)) {
+		cb.Set(field, values[field])
 	}
 	return cb
 }
 
 // Where adds a where condition for UPDATE or DELETE
 func (cb *CommandBuilder) Where(condition domain.Condition) *CommandBuilder {
-	cb.whereConditions = append(cb.whereConditions, condition)
+	cb.where = append(cb.where, condition)
 	return cb
 }
 
 // WhereAnd adds multiple AND conditions
 func (cb *CommandBuilder) WhereAnd(conditions ...domain.Condition) *CommandBuilder {
-	cb.whereConditions = append(cb.whereConditions, conditions...)
+	cb.where = append(cb.where, conditions...)
 	return cb
 }
 
-// Build builds the command
+// Build builds the command: SQL with '?' placeholders, its parameters, and the
+// structured Spec mirroring the SQL.
 func (cb *CommandBuilder) Build() (domain.Command, error) {
 	sql, params, err := cb.BuildRaw()
 	if err != nil {
 		return domain.Command{}, err
 	}
-
 	return domain.Command{
 		SQL:        sql,
 		Parameters: params,
 		Type:       cb.commandType,
-		Options:    domain.CommandOptions{},
+		Spec: &domain.CommandSpec{
+			Table:  cb.table,
+			Values: slices.Clone(cb.values),
+			Where:  cloneConditions(cb.where),
+		},
 	}, nil
 }
 
 // BuildRaw builds the raw SQL and parameters
 func (cb *CommandBuilder) BuildRaw() (string, []interface{}, error) {
+	if cb.table == "" {
+		return "", nil, domain.NewInvalidQueryError("table name is required")
+	}
+	if err := checkIdentifier(identifierPattern, "table", cb.table); err != nil {
+		return "", nil, err
+	}
+
+	var r renderer
+	var sql string
 	switch cb.commandType {
 	case domain.CommandTypeInsert:
-		return cb.buildInsert()
+		if len(cb.where) > 0 {
+			return "", nil, domain.NewInvalidQueryError("INSERT does not support WHERE conditions")
+		}
+		columns, err := cb.columns(&r)
+		if err != nil {
+			return "", nil, err
+		}
+		placeholders := strings.TrimSuffix(strings.Repeat("?, ", len(columns)), ", ")
+		sql = "INSERT INTO " + cb.table + " (" + strings.Join(columns, ", ") + ") VALUES (" + placeholders + ")"
 	case domain.CommandTypeUpdate:
-		return cb.buildUpdate()
+		columns, err := cb.columns(&r)
+		if err != nil {
+			return "", nil, err
+		}
+		for i, column := range columns {
+			columns[i] = column + " = ?"
+		}
+		sql = "UPDATE " + cb.table + " SET " + strings.Join(columns, ", ")
 	case domain.CommandTypeDelete:
-		return cb.buildDelete()
+		if len(cb.values) > 0 {
+			return "", nil, domain.NewInvalidQueryError("DELETE does not support SET values")
+		}
+		sql = "DELETE FROM " + cb.table
 	default:
-		return "", nil, fmt.Errorf("unsupported command type: %v", cb.commandType)
-	}
-}
-
-// buildInsert builds an INSERT statement
-func (cb *CommandBuilder) buildInsert() (string, []interface{}, error) {
-	if cb.table == "" {
-		return "", nil, fmt.Errorf("table name is required for INSERT")
+		return "", nil, domain.NewInvalidQueryError(fmt.Sprintf("unsupported command type %d", cb.commandType))
 	}
 
-	if len(cb.values) == 0 {
-		return "", nil, fmt.Errorf("values are required for INSERT")
-	}
-
-	var fields []string
-	var placeholders []string
-	var params []interface{}
-
-	for field, value := range cb.values {
-		fields = append(fields, field)
-		placeholders = append(placeholders, "?")
-		params = append(params, value)
-	}
-
-	sql := fmt.Sprintf("INSERT INTO %s (%s) VALUES (%s)",
-		cb.table,
-		strings.Join(fields, ", "),
-		strings.Join(placeholders, ", "))
-
-	return sql, params, nil
-}
-
-// buildUpdate builds an UPDATE statement
-func (cb *CommandBuilder) buildUpdate() (string, []interface{}, error) {
-	if cb.table == "" {
-		return "", nil, fmt.Errorf("table name is required for UPDATE")
-	}
-
-	if len(cb.values) == 0 {
-		return "", nil, fmt.Errorf("values are required for UPDATE")
-	}
-
-	var setParts []string
-	var params []interface{}
-
-	for field, value := range cb.values {
-		setParts = append(setParts, fmt.Sprintf("%s = ?", field))
-		params = append(params, value)
-	}
-
-	sql := fmt.Sprintf("UPDATE %s SET %s", cb.table, strings.Join(setParts, ", "))
-
-	// Add WHERE clause if conditions exist
-	if len(cb.whereConditions) > 0 {
-		whereSQL, whereParams := cb.buildWhereClause(cb.whereConditions)
+	if len(cb.where) > 0 {
+		whereSQL, err := r.conditions(cb.where, " AND ")
+		if err != nil {
+			return "", nil, err
+		}
 		sql += " WHERE " + whereSQL
-		params = append(params, whereParams...)
 	}
 
-	return sql, params, nil
+	return sql, r.params, nil
 }
 
-// buildDelete builds a DELETE statement
-func (cb *CommandBuilder) buildDelete() (string, []interface{}, error) {
-	if cb.table == "" {
-		return "", nil, fmt.Errorf("table name is required for DELETE")
+// columns validates the assigned columns and binds their values in Set order.
+func (cb *CommandBuilder) columns(r *renderer) ([]string, error) {
+	if len(cb.values) == 0 {
+		return nil, domain.NewInvalidQueryError("at least one value is required")
 	}
-
-	sql := fmt.Sprintf("DELETE FROM %s", cb.table)
-	var params []interface{}
-
-	// Add WHERE clause if conditions exist
-	if len(cb.whereConditions) > 0 {
-		whereSQL, whereParams := cb.buildWhereClause(cb.whereConditions)
-		sql += " WHERE " + whereSQL
-		params = append(params, whereParams...)
+	columns := make([]string, len(cb.values))
+	for i, fv := range cb.values {
+		if err := checkIdentifier(identifierPattern, "column", fv.Field); err != nil {
+			return nil, err
+		}
+		if _, ok := fv.Value.(domain.ColumnRef); ok {
+			return nil, domain.NewInvalidQueryError("column references are only supported in conditions").
+				WithContext("column", fv.Field)
+		}
+		columns[i] = fv.Field
+		r.params = append(r.params, fv.Value)
 	}
-
-	return sql, params, nil
-}
-
-// buildWhereClause builds the WHERE clause (reused from QueryBuilder)
-func (cb *CommandBuilder) buildWhereClause(conditions []domain.Condition) (string, []interface{}) {
-	if len(conditions) == 0 {
-		return "", nil
-	}
-
-	var parts []string
-	var params []interface{}
-
-	for i, condition := range conditions {
-		condSQL, condParams := cb.buildCondition(condition)
-		if i > 0 {
-			parts = append(parts, "AND")
-		}
-		parts = append(parts, condSQL)
-		params = append(params, condParams...)
-	}
-
-	return strings.Join(parts, " "), params
-}
-
-// buildCondition builds a single condition (reused from QueryBuilder)
-func (cb *CommandBuilder) buildCondition(condition domain.Condition) (string, []interface{}) {
-	switch condition.Operator {
-	case domain.OperatorEqual:
-		return fmt.Sprintf("%s = ?", condition.Field), []interface{}{condition.Value}
-	case domain.OperatorNotEqual:
-		return fmt.Sprintf("%s != ?", condition.Field), []interface{}{condition.Value}
-	case domain.OperatorGreaterThan:
-		return fmt.Sprintf("%s > ?", condition.Field), []interface{}{condition.Value}
-	case domain.OperatorGreaterThanOrEqual:
-		return fmt.Sprintf("%s >= ?", condition.Field), []interface{}{condition.Value}
-	case domain.OperatorLessThan:
-		return fmt.Sprintf("%s < ?", condition.Field), []interface{}{condition.Value}
-	case domain.OperatorLessThanOrEqual:
-		return fmt.Sprintf("%s <= ?", condition.Field), []interface{}{condition.Value}
-	case domain.OperatorLike:
-		return fmt.Sprintf("%s LIKE ?", condition.Field), []interface{}{condition.Value}
-	case domain.OperatorNotLike:
-		return fmt.Sprintf("%s NOT LIKE ?", condition.Field), []interface{}{condition.Value}
-	case domain.OperatorIn:
-		if len(condition.Values) == 0 {
-			return "1=0", nil // No values means no match
-		}
-		placeholders := strings.Repeat("?,", len(condition.Values))
-		placeholders = placeholders[:len(placeholders)-1] // Remove trailing comma
-		return fmt.Sprintf("%s IN (%s)", condition.Field, placeholders), condition.Values
-	case domain.OperatorNotIn:
-		if len(condition.Values) == 0 {
-			return "1=1", nil // No values means all match
-		}
-		placeholders := strings.Repeat("?,", len(condition.Values))
-		placeholders = placeholders[:len(placeholders)-1] // Remove trailing comma
-		return fmt.Sprintf("%s NOT IN (%s)", condition.Field, placeholders), condition.Values
-	case domain.OperatorBetween:
-		if len(condition.Values) >= 2 {
-			return fmt.Sprintf("%s BETWEEN ? AND ?", condition.Field), condition.Values[:2]
-		}
-		return fmt.Sprintf("%s BETWEEN ? AND ?", condition.Field), []interface{}{condition.Value, condition.Value}
-	case domain.OperatorNotBetween:
-		if len(condition.Values) >= 2 {
-			return fmt.Sprintf("%s NOT BETWEEN ? AND ?", condition.Field), condition.Values[:2]
-		}
-		return fmt.Sprintf("%s NOT BETWEEN ? AND ?", condition.Field), []interface{}{condition.Value, condition.Value}
-	case domain.OperatorIsNull:
-		return fmt.Sprintf("%s IS NULL", condition.Field), nil
-	case domain.OperatorIsNotNull:
-		return fmt.Sprintf("%s IS NOT NULL", condition.Field), nil
-	case domain.OperatorExists:
-		return fmt.Sprintf("EXISTS (%s)", condition.Value), nil
-	case domain.OperatorNotExists:
-		return fmt.Sprintf("NOT EXISTS (%s)", condition.Value), nil
-	default:
-		return fmt.Sprintf("%s = ?", condition.Field), []interface{}{condition.Value}
-	}
+	return columns, nil
 }

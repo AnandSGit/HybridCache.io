@@ -1,267 +1,452 @@
-// Basic usage example for Database Agnostic Storage Library
+// Command basic-usage walks through the main features of the library on
+// PostgreSQL: schema management, the query and command builders, joins,
+// transactions and batches.
+//
+// It connects to POSTGRES_DSN (default: the database of docker-compose.yml),
+// works on its own example_users and example_orders tables, and drops them when
+// it finishes:
+//
+//	go run ./examples/basic-usage
 package main
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"log"
+	"os"
 	"time"
 
 	"github.com/AnandSGit/HybridCache.io/pkg/storage"
 )
 
-// User represents a user entity
+const (
+	defaultDSN  = "postgres://testuser:testpass@localhost:5432/testdb?sslmode=disable"
+	usersTable  = "example_users"
+	ordersTable = "example_orders"
+)
+
+// User is a row of the users table. ScanRow maps columns to fields by db tag.
 type User struct {
-	ID        int       `db:"id"`
-	Name      string    `db:"name"`
-	Email     string    `db:"email"`
-	Age       int       `db:"age"`
-	Active    bool      `db:"active"`
-	CreatedAt time.Time `db:"created_at"`
+	ID     int    `db:"id"`
+	Name   string `db:"name"`
+	Email  string `db:"email"`
+	Age    int    `db:"age"`
+	Active bool   `db:"active"`
+}
+
+var users = []User{
+	{ID: 1, Name: "Alice Johnson", Email: "alice@example.com", Age: 29, Active: true},
+	{ID: 2, Name: "Bob Smith", Email: "bob@example.com", Age: 35, Active: true},
+	{ID: 3, Name: "Carol White", Email: "carol@example.com", Age: 42, Active: false},
+	{ID: 4, Name: "Dan Brown", Email: "dan@example.com", Age: 23, Active: true},
 }
 
 func main() {
-	ctx := context.Background()
+	if err := run(context.Background()); err != nil {
+		log.Fatal(err)
+	}
+}
 
-	// Initialize PostgreSQL adapter
-	adapter := storage.NewPostgreSQLAdapter()
-	config := storage.Config{
-		Host:            "localhost",
-		Port:            5432,
-		Database:        "testdb",
-		Username:        "testuser",
-		Password:        "testpass",
-		MaxOpenConns:    10,
-		MaxIdleConns:    5,
-		ConnMaxLifetime: 1 * time.Hour,
-		SSLMode:         "disable",
+func run(ctx context.Context) error {
+	dsn := os.Getenv("POSTGRES_DSN")
+	if dsn == "" {
+		dsn = defaultDSN
 	}
 
-	// Connect to database
+	adapter := storage.NewPostgreSQLAdapter()
+	config, err := adapter.ParseDSN(dsn)
+	if err != nil {
+		return fmt.Errorf("parse POSTGRES_DSN: %w", err)
+	}
+	config.QueryTimeout = 10 * time.Second // the default timeout of each query and command
+
 	store, err := adapter.Connect(ctx, config)
 	if err != nil {
-		log.Fatalf("Failed to connect: %v", err)
+		return fmt.Errorf("connect: %w", err)
 	}
 	defer store.Close()
 
-	fmt.Println("=== Database Agnostic Storage Library - Basic Usage ===")
+	info := store.Info()
+	health := store.Health(ctx)
+	fmt.Printf("Connected to %s (adapter %s): %s\n", info.DatabaseType, info.Version, health.Message)
+	fmt.Printf("Features: %v\n", info.Features)
 
-	// 1. Simple Query
-	fmt.Println("\n1. Simple Query Example:")
-	users, err := getActiveUsers(ctx, store)
-	if err != nil {
-		log.Printf("Error getting users: %v", err)
-	} else {
-		fmt.Printf("Found %d active users\n", len(users))
-		for _, user := range users {
-			fmt.Printf("  - %s (%s)\n", user.Name, user.Email)
+	if err := createTables(ctx, store); err != nil {
+		return err
+	}
+	defer dropTables(store)
+
+	steps := []struct {
+		name string
+		run  func(context.Context, storage.Storage) error
+	}{
+		{"Insert rows", insertRows},
+		{"Query with the builder", queryUsers},
+		{"Find one row", findUsers},
+		{"Update", updateUser},
+		{"Join with aggregates", ordersPerUser},
+		{"Transaction: commit", commitTransaction},
+		{"Transaction: rollback", rollbackTransaction},
+		{"Batch", batch},
+		{"Delete", deleteInactiveUsers},
+		{"Describe a table", describeTable},
+	}
+	for i, step := range steps {
+		fmt.Printf("\n%d. %s\n", i+1, step.name)
+		if err := step.run(ctx, store); err != nil {
+			return fmt.Errorf("%s: %w", step.name, err)
 		}
 	}
 
-	// 2. Insert Example
-	fmt.Println("\n2. Insert Example:")
-	newUser := User{
-		Name:   "Example User",
-		Email:  "example@test.com",
-		Age:    25,
-		Active: true,
-	}
+	fmt.Println("\nDone.")
+	return nil
+}
 
-	if err := createUser(ctx, store, newUser); err != nil {
-		log.Printf("Error creating user: %v", err)
-	} else {
-		fmt.Println("User created successfully")
-	}
+// createTables creates the example tables, replacing any left by an
+// interrupted run.
+func createTables(ctx context.Context, store storage.Storage) error {
+	dropTables(store)
 
-	// 3. Update Example
-	fmt.Println("\n3. Update Example:")
-	if err := updateUserAge(ctx, store, "example@test.com", 26); err != nil {
-		log.Printf("Error updating user: %v", err)
-	} else {
-		fmt.Println("User updated successfully")
+	schemas := []storage.TableSchema{
+		{
+			Name: usersTable,
+			Columns: []storage.ColumnDefinition{
+				{Name: "id", DataType: storage.DataTypeInteger, PrimaryKey: true},
+				{Name: "name", DataType: storage.DataTypeString, Length: 100},
+				{Name: "email", DataType: storage.DataTypeString, Length: 255},
+				{Name: "age", DataType: storage.DataTypeInteger},
+				{Name: "active", DataType: storage.DataTypeBoolean, DefaultValue: true},
+			},
+			Indexes: []storage.IndexDefinition{
+				{Name: usersTable + "_email_key", Columns: []string{"email"}, Unique: true},
+			},
+		},
+		{
+			Name: ordersTable,
+			Columns: []storage.ColumnDefinition{
+				{Name: "id", DataType: storage.DataTypeInteger, PrimaryKey: true, AutoIncrement: true},
+				{Name: "user_id", DataType: storage.DataTypeInteger},
+				{Name: "total", DataType: storage.DataTypeDecimal, Precision: 10, Scale: 2},
+			},
+			Constraints: []storage.ConstraintDefinition{{
+				Name:       ordersTable + "_user_fk",
+				Type:       storage.ConstraintTypeForeignKey,
+				Columns:    []string{"user_id"},
+				RefTable:   usersTable,
+				RefColumns: []string{"id"},
+				OnDelete:   storage.ReferentialActionCascade,
+			}},
+		},
 	}
-
-	// 4. Transaction Example
-	fmt.Println("\n4. Transaction Example:")
-	if err := transferUserStatus(ctx, store); err != nil {
-		log.Printf("Transaction failed: %v", err)
-	} else {
-		fmt.Println("Transaction completed successfully")
+	for _, schema := range schemas {
+		if err := store.CreateTable(ctx, schema); err != nil {
+			return fmt.Errorf("create table %s: %w", schema.Name, err)
+		}
 	}
+	fmt.Printf("Created tables %s and %s\n", usersTable, ordersTable)
+	return nil
+}
 
-	// 5. Complex Query Example
-	fmt.Println("\n5. Complex Query Example:")
-	if err := complexQueryExample(ctx, store); err != nil {
-		log.Printf("Complex query failed: %v", err)
-	} else {
-		fmt.Println("Complex query executed successfully")
+func dropTables(store storage.Storage) {
+	for _, table := range []string{ordersTable, usersTable} {
+		if err := store.DropTable(context.Background(), table); err != nil {
+			log.Printf("drop table %s: %v", table, err)
+		}
 	}
 }
 
-// getActiveUsers demonstrates a simple SELECT query
-func getActiveUsers(ctx context.Context, store storage.Storage) ([]User, error) {
-	query := storage.NewBuilder().
-		Select("id", "name", "email", "age", "active", "created_at").
-		From("users").
+func insertUser(u User) *storage.CommandBuilder {
+	return storage.Insert(usersTable).
+		Set("id", u.ID).
+		Set("name", u.Name).
+		Set("email", u.Email).
+		Set("age", u.Age).
+		Set("active", u.Active)
+}
+
+func execute(ctx context.Context, store storage.Storage, b *storage.CommandBuilder) (int64, error) {
+	command, err := b.Build()
+	if err != nil {
+		return 0, err
+	}
+	result, err := store.Execute(ctx, command)
+	if err != nil {
+		return 0, err
+	}
+	return result.RowsAffected, nil
+}
+
+func insertRows(ctx context.Context, store storage.Storage) error {
+	for _, u := range users {
+		if _, err := execute(ctx, store, insertUser(u)); err != nil {
+			return err
+		}
+	}
+	orders := []struct {
+		userID int
+		total  float64
+	}{{1, 25.50}, {1, 74.25}, {2, 12.00}, {4, 99.99}, {4, 5.00}, {4, 42.10}}
+	for _, o := range orders {
+		// id is an identity column, so the database assigns it.
+		if _, err := execute(ctx, store, storage.Insert(ordersTable).Set("user_id", o.userID).Set("total", o.total)); err != nil {
+			return err
+		}
+	}
+	fmt.Printf("   Inserted %d users and %d orders\n", len(users), len(orders))
+
+	// The unique index on email rejects a second user with the same address.
+	_, err := execute(ctx, store, insertUser(User{ID: 5, Name: "Alice Again", Email: "alice@example.com", Age: 30}))
+	switch {
+	case err == nil:
+		return errors.New("a duplicate email was accepted")
+	case !errors.Is(err, storage.ErrDuplicateKey):
+		return err
+	}
+	fmt.Println("   A duplicate email is rejected with storage.ErrDuplicateKey")
+	return nil
+}
+
+func queryUsers(ctx context.Context, store storage.Storage) error {
+	query, err := storage.NewBuilder().
+		Select("id", "name", "email", "age", "active").
+		From(usersTable).
 		Where(storage.Equal("active", true)).
-		OrderBy("name", storage.SortDirectionAsc).
-		Limit(10)
-
-	queryObj, err := query.Build()
+		WhereOr(storage.LessThan("age", 30), storage.Like("email", "bob@%")).
+		OrderByAsc("name").
+		Page(1, 10).
+		Build()
 	if err != nil {
-		return nil, fmt.Errorf("failed to build query: %w", err)
+		return err
 	}
+	fmt.Printf("   %s %v\n", query.SQL, query.Parameters)
 
-	result, err := store.Query(ctx, queryObj)
+	rows, err := store.Query(ctx, query)
 	if err != nil {
-		return nil, fmt.Errorf("failed to execute query: %w", err)
+		return err
 	}
-	defer result.Close()
-
-	var users []User
-	for result.Next() {
-		var user User
-		if err := result.ScanRow(&user); err != nil {
-			return nil, fmt.Errorf("failed to scan user: %w", err)
+	defer rows.Close()
+	for rows.Next() {
+		var u User
+		if err := rows.ScanRow(&u); err != nil {
+			return err
 		}
-		users = append(users, user)
+		fmt.Printf("   - %-13s %-18s age %d\n", u.Name, u.Email, u.Age)
 	}
-
-	if err := result.Err(); err != nil {
-		return nil, fmt.Errorf("result error: %w", err)
-	}
-
-	return users, nil
+	return rows.Err()
 }
 
-// createUser demonstrates an INSERT command
-func createUser(ctx context.Context, store storage.Storage, user User) error {
-	cmd := storage.Insert("users").
-		Set("name", user.Name).
-		Set("email", user.Email).
-		Set("age", user.Age).
-		Set("active", user.Active)
+func findUsers(ctx context.Context, store storage.Storage) error {
+	for _, email := range []string{"carol@example.com", "nobody@example.com"} {
+		query, err := storage.NewBuilder().
+			Select("name", "age").
+			From(usersTable).
+			Where(storage.Equal("email", email)).
+			Build()
+		if err != nil {
+			return err
+		}
 
-	command, err := cmd.Build()
-	if err != nil {
-		return fmt.Errorf("failed to build insert command: %w", err)
+		var name string
+		var age int
+		row, err := store.QueryOne(ctx, query)
+		if err == nil {
+			err = row.Scan(&name, &age)
+		}
+		switch {
+		case errors.Is(err, storage.ErrNoRows):
+			fmt.Printf("   %s: not found\n", email)
+		case err != nil:
+			return err
+		default:
+			fmt.Printf("   %s: %s, age %d\n", email, name, age)
+		}
 	}
-
-	result, err := store.Execute(ctx, command)
-	if err != nil {
-		return fmt.Errorf("failed to execute insert: %w", err)
-	}
-
-	fmt.Printf("Rows affected: %d\n", result.RowsAffected)
 	return nil
 }
 
-// updateUserAge demonstrates an UPDATE command
-func updateUserAge(ctx context.Context, store storage.Storage, email string, newAge int) error {
-	cmd := storage.Update("users").
-		Set("age", newAge).
-		Set("updated_at", time.Now()).
-		Where(storage.Equal("email", email))
-
-	command, err := cmd.Build()
+func updateUser(ctx context.Context, store storage.Storage) error {
+	n, err := execute(ctx, store, storage.Update(usersTable).
+		Set("age", 30).
+		Where(storage.Equal("email", "alice@example.com")))
 	if err != nil {
-		return fmt.Errorf("failed to build update command: %w", err)
+		return err
 	}
-
-	result, err := store.Execute(ctx, command)
-	if err != nil {
-		return fmt.Errorf("failed to execute update: %w", err)
-	}
-
-	fmt.Printf("Rows affected: %d\n", result.RowsAffected)
+	fmt.Printf("   Updated %d row(s)\n", n)
 	return nil
 }
 
-// transferUserStatus demonstrates transaction usage
-func transferUserStatus(ctx context.Context, store storage.Storage) error {
+func ordersPerUser(ctx context.Context, store storage.Storage) error {
+	// Col compares with a column; a plain value would be bound as a parameter.
+	query, err := storage.NewBuilder().
+		Select("u.name", "COUNT(o.id) AS order_count", "SUM(o.total) AS spent").
+		From(usersTable+" u").
+		LeftJoin(ordersTable+" o", storage.Equal("o.user_id", storage.Col("u.id"))).
+		GroupBy("u.id", "u.name").
+		Having(storage.GreaterThan("COUNT(o.id)", 0)).
+		OrderByDesc("order_count").
+		Build()
+	if err != nil {
+		return err
+	}
+
+	rows, err := store.Query(ctx, query)
+	if err != nil {
+		return err
+	}
+	defer rows.Close()
+	for rows.Next() {
+		var name string
+		var orders int64
+		var spent float64
+		if err := rows.Scan(&name, &orders, &spent); err != nil {
+			return err
+		}
+		fmt.Printf("   - %-13s %d order(s), %.2f in total\n", name, orders, spent)
+	}
+	return rows.Err()
+}
+
+func commitTransaction(ctx context.Context, store storage.Storage) error {
 	tx, err := store.BeginTx(ctx, &storage.TxOptions{
 		Isolation: storage.IsolationLevelReadCommitted,
 		Timeout:   30 * time.Second,
 	})
 	if err != nil {
-		return fmt.Errorf("failed to begin transaction: %w", err)
+		return err
 	}
-	defer tx.Rollback()
+	defer func() { _ = tx.Rollback() }() // does nothing once the transaction is committed
 
-	// Deactivate one user
-	deactivateCmd := storage.Update("users").
-		Set("active", false).
-		Where(storage.Equal("email", "bob.johnson@example.com"))
-
-	command1, err := deactivateCmd.Build()
-	if err != nil {
-		return fmt.Errorf("failed to build deactivate command: %w", err)
+	// Move Dan's large orders to Bob and deactivate Dan, atomically.
+	changes := []*storage.CommandBuilder{
+		storage.Update(ordersTable).
+			Set("user_id", 2).
+			Where(storage.Equal("user_id", 4)).
+			Where(storage.GreaterThan("total", 50)),
+		storage.Update(usersTable).Set("active", false).Where(storage.Equal("id", 4)),
 	}
-
-	result1, err := tx.Execute(ctx, command1)
-	if err != nil {
-		return fmt.Errorf("failed to deactivate user: %w", err)
-	}
-
-	// Activate another user
-	activateCmd := storage.Update("users").
-		Set("active", true).
-		Where(storage.Equal("email", "example@test.com"))
-
-	command2, err := activateCmd.Build()
-	if err != nil {
-		return fmt.Errorf("failed to build activate command: %w", err)
+	for _, change := range changes {
+		command, err := change.Build()
+		if err != nil {
+			return err
+		}
+		result, err := tx.Execute(ctx, command)
+		if err != nil {
+			return err
+		}
+		fmt.Printf("   %s -> %d row(s)\n", command.SQL, result.RowsAffected)
 	}
 
-	result2, err := tx.Execute(ctx, command2)
-	if err != nil {
-		return fmt.Errorf("failed to activate user: %w", err)
-	}
-
-	fmt.Printf("Deactivated %d users, activated %d users\n",
-		result1.RowsAffected, result2.RowsAffected)
-
-	// Commit transaction
 	if err := tx.Commit(); err != nil {
-		return fmt.Errorf("failed to commit transaction: %w", err)
+		return err
 	}
-
+	fmt.Println("   Committed")
 	return nil
 }
 
-// complexQueryExample demonstrates complex queries with joins
-func complexQueryExample(ctx context.Context, store storage.Storage) error {
-	// Query users with their order counts
-	query := storage.NewBuilder().
-		Select("u.name", "u.email", "COUNT(o.id) as order_count").
-		From("users u").
-		LeftJoin("orders o", storage.Equal("o.user_id", "u.id")).
-		Where(storage.Equal("u.active", true)).
-		GroupBy("u.id", "u.name", "u.email").
-		Having(storage.GreaterThan("COUNT(o.id)", 0)).
-		OrderBy("order_count", storage.SortDirectionDesc).
-		Limit(5)
-
-	queryObj, err := query.Build()
+func rollbackTransaction(ctx context.Context, store storage.Storage) error {
+	tx, err := store.BeginTx(ctx, nil)
 	if err != nil {
-		return fmt.Errorf("failed to build complex query: %w", err)
+		return err
+	}
+	command, err := storage.Delete(ordersTable).Build()
+	if err != nil {
+		return err
+	}
+	result, err := tx.Execute(ctx, command)
+	if err != nil {
+		_ = tx.Rollback()
+		return err
+	}
+	if err := tx.Rollback(); err != nil {
+		return err
 	}
 
-	result, err := store.Query(ctx, queryObj)
+	n, err := countRows(ctx, store, ordersTable)
 	if err != nil {
-		return fmt.Errorf("failed to execute complex query: %w", err)
+		return err
 	}
-	defer result.Close()
+	fmt.Printf("   Deleted %d orders in a transaction and rolled it back: %d orders remain\n", result.RowsAffected, n)
+	return nil
+}
 
-	fmt.Println("Users with orders:")
-	for result.Next() {
-		var name, email string
-		var orderCount int
-		if err := result.Scan(&name, &email, &orderCount); err != nil {
-			return fmt.Errorf("failed to scan result: %w", err)
+func countRows(ctx context.Context, store storage.Storage, table string) (int64, error) {
+	query, err := storage.NewBuilder().SelectCount("*").From(table).Build()
+	if err != nil {
+		return 0, err
+	}
+	var n int64
+	row, err := store.QueryOne(ctx, query)
+	if err == nil {
+		err = row.Scan(&n)
+	}
+	return n, err
+}
+
+func batch(ctx context.Context, store storage.Storage) error {
+	var operations []storage.Operation
+	for _, u := range []User{
+		{ID: 5, Name: "Eve Adams", Email: "eve@example.com", Age: 31, Active: true},
+		{ID: 6, Name: "Frank Moore", Email: "frank@example.com", Age: 48, Active: true},
+	} {
+		command, err := insertUser(u).Build()
+		if err != nil {
+			return err
 		}
-		fmt.Printf("  - %s (%s): %d orders\n", name, email, orderCount)
+		operations = append(operations, storage.Operation{Type: storage.OperationTypeCommand, Command: command})
 	}
+	query, err := storage.NewBuilder().SelectCount("*").From(usersTable).Build()
+	if err != nil {
+		return err
+	}
+	operations = append(operations, storage.Operation{Type: storage.OperationTypeQuery, Query: query})
 
-	return result.Err()
+	// PostgreSQL sends the batch in one round trip and runs it atomically: if an
+	// operation fails, Batch returns its error and nothing is applied.
+	results, err := store.Batch(ctx, operations)
+	if err != nil {
+		return err
+	}
+	for _, r := range results {
+		switch result := r.Result.(type) {
+		case storage.ExecuteResult:
+			fmt.Printf("   Operation %d: %d row(s) affected\n", r.Index, result.RowsAffected)
+		case storage.Result:
+			var n int64
+			if result.Next() {
+				if err := result.Scan(&n); err != nil {
+					return err
+				}
+			}
+			if err := result.Close(); err != nil {
+				return err
+			}
+			fmt.Printf("   Operation %d: %d users\n", r.Index, n)
+		}
+	}
+	return nil
+}
+
+func deleteInactiveUsers(ctx context.Context, store storage.Storage) error {
+	n, err := execute(ctx, store, storage.Delete(usersTable).Where(storage.Equal("active", false)))
+	if err != nil {
+		return err
+	}
+	orders, err := countRows(ctx, store, ordersTable)
+	if err != nil {
+		return err
+	}
+	fmt.Printf("   Deleted %d inactive user(s); ON DELETE CASCADE removed their orders, %d remain\n", n, orders)
+	return nil
+}
+
+func describeTable(ctx context.Context, store storage.Storage) error {
+	schema, err := store.DescribeTable(ctx, usersTable)
+	if err != nil {
+		return err
+	}
+	for _, c := range schema.Columns {
+		fmt.Printf("   - %-6s %-8s nullable=%-5t primary key=%t\n", c.Name, c.DataType, c.Nullable, c.PrimaryKey)
+	}
+	return nil
 }

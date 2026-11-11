@@ -1,60 +1,64 @@
 """
 Query builder package for the Database Agnostic Storage Library.
 
-This package provides a fluent API for building database queries and commands
-in a database-agnostic way.
+Fluent builders for SELECT queries and INSERT/UPDATE/DELETE commands, plus the
+condition helpers. ``build()`` returns a ``Query``/``Command`` holding both SQL
+with ``?`` placeholders and the structured spec, so the result runs on SQL and
+document adapters alike.
 """
 
 from storage.query.builder import (
-    QueryBuilder,
     CommandBuilder,
-    # Condition helpers
+    QueryBuilder,
+    and_,
+    between,
+    col,
+    delete,
     equal,
-    not_equal,
+    exists,
     greater_than,
     greater_than_or_equal,
+    in_,
+    insert,
+    is_not_null,
+    is_null,
     less_than,
     less_than_or_equal,
     like,
-    not_like,
-    in_,
-    not_in,
-    between,
     not_between,
-    is_null,
-    is_not_null,
-    exists,
+    not_equal,
     not_exists,
-    # Builder functions
+    not_in,
+    not_like,
+    or_,
     select,
-    insert,
     update,
-    delete,
 )
 
 __all__ = [
-    "QueryBuilder",
     "CommandBuilder",
-    # Condition helpers
+    "QueryBuilder",
+    "and_",
+    "between",
+    "col",
+    "delete",
     "equal",
-    "not_equal", 
+    "exists",
     "greater_than",
     "greater_than_or_equal",
+    "in_",
+    "insert",
+    "is_not_null",
+    "is_null",
     "less_than",
     "less_than_or_equal",
     "like",
-    "not_like",
-    "in_",
-    "not_in",
-    "between",
     "not_between",
-    "is_null",
-    "is_not_null",
-    "exists",
+    "not_equal",
     "not_exists",
-    # Builder functions
+    "not_in",
+    "not_like",
+    "or_",
     "select",
-    "insert",
     "update",
-    "delete",
 ]

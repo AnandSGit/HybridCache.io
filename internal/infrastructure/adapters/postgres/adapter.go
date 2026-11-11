@@ -3,15 +3,19 @@ package postgres
 
 import (
 	"context"
+	"errors"
 	"fmt"
+	"math"
 	"net/url"
+	"sort"
 	"strconv"
 	"strings"
 	"time"
 
-	"github.com/AnandSGit/HybridCache.io/internal/domain"
-	"github.com/jackc/pgx/v5"
+	"github.com/jackc/pgx/v5/pgconn"
 	"github.com/jackc/pgx/v5/pgxpool"
+
+	"github.com/AnandSGit/HybridCache.io/internal/domain"
 )
 
 // Adapter implements the domain.Adapter interface for PostgreSQL
@@ -43,151 +47,188 @@ func (a *Adapter) DatabaseType() domain.DatabaseType {
 	return domain.DatabaseTypePostgreSQL
 }
 
-// Connect creates a new storage instance
+// Connect creates a connection pool and verifies that the database is reachable.
 func (a *Adapter) Connect(ctx context.Context, config domain.Config) (domain.Storage, error) {
 	if err := a.ValidateConfig(config); err != nil {
-		return nil, domain.NewConnectionError("INVALID_CONFIG", err.Error()).WithCause(err)
+		return nil, err
 	}
 
-	dsn, err := a.buildDSN(config)
+	poolConfig, err := buildPoolConfig(config)
 	if err != nil {
-		return nil, domain.NewConnectionError("INVALID_DSN", "failed to build DSN").WithCause(err)
-	}
-
-	poolConfig, err := pgxpool.ParseConfig(dsn)
-	if err != nil {
-		return nil, domain.NewConnectionError("INVALID_DSN", "failed to parse DSN").WithCause(err)
-	}
-
-	// Configure connection pool
-	poolConfig.MaxConns = int32(config.MaxOpenConns)
-	poolConfig.MinConns = int32(config.MaxIdleConns)
-	poolConfig.MaxConnLifetime = config.ConnMaxLifetime
-	poolConfig.MaxConnIdleTime = config.ConnMaxIdleTime
-
-	// Configure connection timeouts
-	if config.ConnectTimeout > 0 {
-		poolConfig.ConnConfig.ConnectTimeout = config.ConnectTimeout
+		return nil, err
 	}
 
 	pool, err := pgxpool.NewWithConfig(ctx, poolConfig)
 	if err != nil {
-		return nil, domain.NewConnectionError("CONNECTION_FAILED", "failed to create connection pool").WithCause(err)
+		return nil, connectionError(err, "failed to create connection pool")
 	}
 
-	// Test the connection
 	if err := pool.Ping(ctx); err != nil {
 		pool.Close()
-		return nil, domain.NewConnectionError("CONNECTION_FAILED", "failed to ping database").WithCause(err)
+		return nil, connectionError(err, "failed to connect to PostgreSQL")
 	}
 
-	return &PostgreSQLStorage{
-		pool:    pool,
-		config:  config,
-		adapter: a,
-	}, nil
+	return newStorage(pool, config, a, int(poolConfig.MaxConns)), nil
 }
 
-// ParseDSN parses a PostgreSQL DSN into a Config
+// buildPoolConfig builds the pgxpool configuration. Pool settings from the DSN
+// (or pgx's defaults) are overridden only by Config fields that are set (> 0).
+func buildPoolConfig(config domain.Config) (*pgxpool.Config, error) {
+	dsn, err := buildDSN(config)
+	if err != nil {
+		return nil, err
+	}
+
+	poolConfig, err := pgxpool.ParseConfig(dsn)
+	if err != nil {
+		return nil, domain.NewConnectionError("INVALID_DSN", "failed to parse PostgreSQL connection string").WithCause(err)
+	}
+
+	// ValidateConfig bounds both counts to int32.
+	if n := config.MaxOpenConns; n > 0 && n <= math.MaxInt32 {
+		poolConfig.MaxConns = int32(n)
+	}
+	if n := config.MaxIdleConns; n > 0 && n <= math.MaxInt32 {
+		poolConfig.MinConns = int32(n)
+	}
+	if config.ConnMaxLifetime > 0 {
+		poolConfig.MaxConnLifetime = config.ConnMaxLifetime
+	}
+	if config.ConnMaxIdleTime > 0 {
+		poolConfig.MaxConnIdleTime = config.ConnMaxIdleTime
+	}
+	if config.ConnectTimeout > 0 {
+		poolConfig.ConnConfig.ConnectTimeout = config.ConnectTimeout
+	}
+
+	if poolConfig.MinConns > poolConfig.MaxConns {
+		return nil, invalidConfig(fmt.Sprintf("max idle connections (%d) cannot exceed the pool size (%d)",
+			poolConfig.MinConns, poolConfig.MaxConns))
+	}
+	return poolConfig, nil
+}
+
+// connectionError maps a failure to reach the database.
+func connectionError(err error, msg string) error {
+	if errors.Is(err, context.DeadlineExceeded) || pgconn.Timeout(err) {
+		return domain.NewConnectionTimeoutError(msg).WithCause(err)
+	}
+	return domain.NewConnectionError("CONNECTION_FAILED", msg).WithCause(err)
+}
+
+func invalidConfig(msg string) *domain.StorageError {
+	return domain.NewStorageError(domain.ErrorTypeValidation, "INVALID_CONFIG", msg)
+}
+
+// ParseDSN parses a PostgreSQL DSN into a Config. A postgres:// or
+// postgresql:// URL is split into the Config fields (unknown query parameters
+// go to Options); a key=value DSN is kept in Config.DSN.
 func (a *Adapter) ParseDSN(dsn string) (domain.Config, error) {
 	config := domain.Config{
 		Options: make(map[string]interface{}),
 	}
 
-	// Handle postgres:// URLs
-	if strings.HasPrefix(dsn, "postgres://") || strings.HasPrefix(dsn, "postgresql://") {
-		u, err := url.Parse(dsn)
-		if err != nil {
-			return config, fmt.Errorf("invalid DSN URL: %w", err)
-		}
-
-		config.Host = u.Hostname()
-		if u.Port() != "" {
-			if port, err := strconv.Atoi(u.Port()); err == nil {
-				config.Port = port
-			}
-		}
-
-		if u.User != nil {
-			config.Username = u.User.Username()
-			if password, ok := u.User.Password(); ok {
-				config.Password = password
-			}
-		}
-
-		config.Database = strings.TrimPrefix(u.Path, "/")
-
-		// Parse query parameters
-		for key, values := range u.Query() {
-			if len(values) > 0 {
-				switch key {
-				case "sslmode":
-					config.SSLMode = values[0]
-				case "connect_timeout":
-					if timeout, err := strconv.Atoi(values[0]); err == nil {
-						config.ConnectTimeout = time.Duration(timeout) * time.Second
-					}
-				default:
-					config.Options[key] = values[0]
-				}
-			}
-		}
-	} else {
-		// Handle key=value format
+	if !strings.HasPrefix(dsn, "postgres://") && !strings.HasPrefix(dsn, "postgresql://") {
 		config.DSN = dsn
+		return config, nil
+	}
+
+	u, err := url.Parse(dsn)
+	if err != nil {
+		return config, domain.NewConnectionError("INVALID_DSN", "invalid PostgreSQL connection URL").WithCause(err)
+	}
+
+	config.Host = u.Hostname()
+	if u.Port() != "" {
+		port, err := strconv.Atoi(u.Port())
+		if err != nil {
+			return config, domain.NewConnectionError("INVALID_DSN", "invalid port in PostgreSQL connection URL").WithCause(err)
+		}
+		config.Port = port
+	}
+
+	if u.User != nil {
+		config.Username = u.User.Username()
+		if password, ok := u.User.Password(); ok {
+			config.Password = password
+		}
+	}
+
+	config.Database = strings.TrimPrefix(u.Path, "/")
+
+	for key, values := range u.Query() {
+		if len(values) == 0 {
+			continue
+		}
+		switch key {
+		case "sslmode":
+			config.SSLMode = values[0]
+		case "connect_timeout":
+			if timeout, err := strconv.Atoi(values[0]); err == nil {
+				config.ConnectTimeout = time.Duration(timeout) * time.Second
+			}
+		default:
+			config.Options[key] = values[0]
+		}
 	}
 
 	return config, nil
 }
 
-// ValidateConfig validates the configuration
+// ValidateConfig validates the configuration. Zero pool settings and timeouts
+// mean "use the default"; negative values are invalid.
 func (a *Adapter) ValidateConfig(config domain.Config) error {
 	if config.DSN == "" {
 		if config.Host == "" {
-			return fmt.Errorf("host is required")
+			return invalidConfig("host is required")
 		}
 		if config.Database == "" {
-			return fmt.Errorf("database is required")
+			return invalidConfig("database is required")
 		}
 		if config.Username == "" {
-			return fmt.Errorf("username is required")
+			return invalidConfig("username is required")
 		}
 	}
 
-	if config.MaxOpenConns <= 0 {
-		return fmt.Errorf("max open connections must be positive")
+	switch {
+	case config.MaxOpenConns < 0:
+		return invalidConfig("max open connections cannot be negative")
+	case config.MaxOpenConns > math.MaxInt32:
+		return invalidConfig("max open connections is too large")
+	case config.MaxIdleConns < 0:
+		return invalidConfig("max idle connections cannot be negative")
+	case config.MaxIdleConns > math.MaxInt32:
+		return invalidConfig("max idle connections is too large")
+	case config.MaxOpenConns > 0 && config.MaxIdleConns > config.MaxOpenConns:
+		return invalidConfig("max idle connections cannot exceed max open connections")
 	}
 
-	if config.MaxIdleConns < 0 {
-		return fmt.Errorf("max idle connections cannot be negative")
-	}
-
-	if config.MaxIdleConns > config.MaxOpenConns {
-		return fmt.Errorf("max idle connections cannot exceed max open connections")
+	for _, d := range []struct {
+		name  string
+		value time.Duration
+	}{
+		{"connection max lifetime", config.ConnMaxLifetime},
+		{"connection max idle time", config.ConnMaxIdleTime},
+		{"connect timeout", config.ConnectTimeout},
+		{"query timeout", config.QueryTimeout},
+		{"transaction timeout", config.TxTimeout},
+	} {
+		if d.value < 0 {
+			return invalidConfig(d.name + " cannot be negative")
+		}
 	}
 
 	return nil
 }
 
-// TranslateQuery translates a domain.Query to PostgreSQL SQL
+// TranslateQuery converts the query's '?' placeholders to PostgreSQL's $n form;
+// see rebind for the rules. SQL using $n placeholders is returned unchanged.
 func (a *Adapter) TranslateQuery(query domain.Query) (string, []interface{}, error) {
-	// PostgreSQL uses $1, $2, etc. for parameters
-	sql := query.SQL
-	params := query.Parameters
-
-	// Convert ? placeholders to $n format
-	paramIndex := 1
-	var result strings.Builder
-	for _, char := range sql {
-		if char == '?' {
-			result.WriteString(fmt.Sprintf("$%d", paramIndex))
-			paramIndex++
-		} else {
-			result.WriteRune(char)
-		}
+	sql, err := translateSQL(query.SQL)
+	if err != nil {
+		return "", nil, err
 	}
-
-	return result.String(), params, nil
+	return sql, query.Parameters, nil
 }
 
 // TranslateCommand translates a domain.Command to PostgreSQL SQL
@@ -220,15 +261,31 @@ func (a *Adapter) MapGoType(goType interface{}) (domain.DataType, error) {
 	}
 }
 
-// MapDatabaseType maps a PostgreSQL type to a domain.DataType
+// MapDatabaseType maps a PostgreSQL type name, as written in SQL or reported by
+// information_schema (e.g. "character varying(255)", "integer[]", "_int4",
+// "ARRAY", "timestamp(3) with time zone"), to a domain.DataType.
 func (a *Adapter) MapDatabaseType(dbType string) (domain.DataType, error) {
-	switch strings.ToLower(dbType) {
-	case "text", "varchar", "char", "character", "character varying":
+	t := strings.ToLower(strings.TrimSpace(dbType))
+	if strings.HasSuffix(t, "[]") || (len(t) > 1 && t[0] == '_') || t == "array" {
+		return domain.DataTypeArray, nil
+	}
+	if open := strings.IndexByte(t, '('); open >= 0 { // drop type modifiers
+		if end := strings.IndexByte(t[open:], ')'); end >= 0 {
+			t = t[:open] + " " + t[open+end+1:]
+		}
+	}
+	t = strings.Join(strings.Fields(t), " ")
+
+	switch t {
+	case "text", "varchar", "char", "character", "character varying", "bpchar", "name":
 		return domain.DataTypeString, nil
-	case "integer", "int", "int4", "bigint", "int8", "smallint", "int2":
+	case "smallint", "int2", "integer", "int", "int4", "bigint", "int8",
+		"smallserial", "serial2", "serial", "serial4", "bigserial", "serial8":
 		return domain.DataTypeInteger, nil
-	case "real", "float4", "double precision", "float8", "numeric", "decimal":
+	case "real", "float4", "double precision", "float8", "float":
 		return domain.DataTypeFloat, nil
+	case "numeric", "decimal":
+		return domain.DataTypeDecimal, nil
 	case "boolean", "bool":
 		return domain.DataTypeBoolean, nil
 	case "timestamp", "timestamptz", "timestamp with time zone", "timestamp without time zone":
@@ -243,8 +300,6 @@ func (a *Adapter) MapDatabaseType(dbType string) (domain.DataType, error) {
 		return domain.DataTypeJSON, nil
 	case "uuid":
 		return domain.DataTypeUUID, nil
-	case "array":
-		return domain.DataTypeArray, nil
 	default:
 		return domain.DataTypeUnknown, fmt.Errorf("unsupported PostgreSQL type: %s", dbType)
 	}
@@ -270,484 +325,96 @@ func (a *Adapter) SupportsSchema() bool {
 	return true
 }
 
-// buildDSN builds a PostgreSQL DSN from the config
-func (a *Adapter) buildDSN(config domain.Config) (string, error) {
+// buildDSN builds a key=value DSN from the config. Every value is quoted and
+// escaped (libpq rules), so values with spaces, quotes or backslashes cannot
+// break the DSN or inject parameters. Options are appended in sorted key order.
+func buildDSN(config domain.Config) (string, error) {
 	if config.DSN != "" {
 		return config.DSN, nil
 	}
 
-	var parts []string
+	var b strings.Builder
+	add := func(key, value string) {
+		if b.Len() > 0 {
+			b.WriteByte(' ')
+		}
+		b.WriteString(key)
+		b.WriteString("='")
+		b.WriteString(strings.NewReplacer(`\`, `\\`, `'`, `\'`).Replace(value))
+		b.WriteByte('\'')
+	}
 
-	// Host and port
+	add("host", config.Host)
 	if config.Port > 0 {
-		parts = append(parts, fmt.Sprintf("host=%s port=%d", config.Host, config.Port))
-	} else {
-		parts = append(parts, fmt.Sprintf("host=%s", config.Host))
+		add("port", strconv.Itoa(config.Port))
 	}
-
-	// Database
-	parts = append(parts, fmt.Sprintf("dbname=%s", config.Database))
-
-	// User and password
-	parts = append(parts, fmt.Sprintf("user=%s", config.Username))
+	add("dbname", config.Database)
+	add("user", config.Username)
 	if config.Password != "" {
-		parts = append(parts, fmt.Sprintf("password=%s", config.Password))
+		add("password", config.Password)
 	}
-
-	// SSL mode
 	if config.SSLMode != "" {
-		parts = append(parts, fmt.Sprintf("sslmode=%s", config.SSLMode))
+		add("sslmode", config.SSLMode)
 	} else {
-		parts = append(parts, "sslmode=prefer")
+		add("sslmode", "prefer")
 	}
-
-	// SSL certificates
 	if config.SSLCert != "" {
-		parts = append(parts, fmt.Sprintf("sslcert=%s", config.SSLCert))
+		add("sslcert", config.SSLCert)
 	}
 	if config.SSLKey != "" {
-		parts = append(parts, fmt.Sprintf("sslkey=%s", config.SSLKey))
+		add("sslkey", config.SSLKey)
 	}
 	if config.SSLRootCA != "" {
-		parts = append(parts, fmt.Sprintf("sslrootcert=%s", config.SSLRootCA))
+		add("sslrootcert", config.SSLRootCA)
+	}
+	// ConnectTimeout is applied to the pool config directly (sub-second precision).
+
+	keys := make([]string, 0, len(config.Options))
+	for key := range config.Options {
+		keys = append(keys, key)
+	}
+	sort.Strings(keys)
+	for _, key := range keys {
+		if !validOptionKey(key) {
+			return "", invalidConfig(fmt.Sprintf("invalid connection option name %q", key))
+		}
+		value, err := optionValue(config.Options[key])
+		if err != nil {
+			return "", invalidConfig(fmt.Sprintf("connection option %q: %v", key, err))
+		}
+		add(key, value)
 	}
 
-	// Timeouts
-	if config.ConnectTimeout > 0 {
-		parts = append(parts, fmt.Sprintf("connect_timeout=%d", int(config.ConnectTimeout.Seconds())))
+	if strings.IndexByte(b.String(), 0) >= 0 {
+		return "", invalidConfig("connection settings cannot contain NUL bytes")
 	}
+	return b.String(), nil
+}
 
-	// Additional options
-	for key, value := range config.Options {
-		if strValue, ok := value.(string); ok {
-			parts = append(parts, fmt.Sprintf("%s=%s", key, strValue))
+// validOptionKey reports whether key is a plausible connection parameter or
+// run-time setting name (letters, digits, '_', '.', '-').
+func validOptionKey(key string) bool {
+	if key == "" {
+		return false
+	}
+	for _, r := range key {
+		if !(r == '_' || r == '.' || r == '-' || (r >= '0' && r <= '9') || (r|0x20 >= 'a' && r|0x20 <= 'z')) {
+			return false
 		}
 	}
-
-	return strings.Join(parts, " "), nil
+	return true
 }
 
-// PostgreSQLStorage implements the domain.Storage interface for PostgreSQL
-type PostgreSQLStorage struct {
-	pool    *pgxpool.Pool
-	config  domain.Config
-	adapter *Adapter
-}
-
-// Connect establishes the connection (already done in constructor)
-func (s *PostgreSQLStorage) Connect(ctx context.Context) error {
-	return s.pool.Ping(ctx)
-}
-
-// Close closes the connection pool
-func (s *PostgreSQLStorage) Close() error {
-	s.pool.Close()
-	return nil
-}
-
-// Ping tests the connection
-func (s *PostgreSQLStorage) Ping(ctx context.Context) error {
-	return s.pool.Ping(ctx)
-}
-
-// Health returns the health status
-func (s *PostgreSQLStorage) Health(ctx context.Context) domain.HealthStatus {
-	status := domain.HealthStatus{
-		Timestamp: time.Now(),
-		Details:   make(map[string]interface{}),
-	}
-
-	if err := s.pool.Ping(ctx); err != nil {
-		status.Status = domain.HealthStatusUnhealthy
-		status.Message = fmt.Sprintf("ping failed: %v", err)
-		return status
-	}
-
-	stats := s.pool.Stat()
-	status.Status = domain.HealthStatusHealthy
-	status.Message = "connection pool healthy"
-	status.Details["total_connections"] = stats.TotalConns()
-	status.Details["idle_connections"] = stats.IdleConns()
-	status.Details["acquired_connections"] = stats.AcquiredConns()
-
-	return status
-}
-
-// Info returns storage information
-func (s *PostgreSQLStorage) Info() domain.StorageInfo {
-	return domain.StorageInfo{
-		Name:         s.adapter.Name(),
-		Version:      s.adapter.Version(),
-		DatabaseType: s.adapter.DatabaseType(),
-		Features: []string{
-			"transactions",
-			"joins",
-			"batch",
-			"schema",
-			"json",
-			"arrays",
-			"full-text-search",
-		},
-		Limits: domain.StorageLimits{
-			MaxConnections:    s.config.MaxOpenConns,
-			MaxQuerySize:      1024 * 1024 * 1024, // 1GB
-			MaxTransactionAge: 24 * time.Hour,
-			MaxBatchSize:      10000,
-		},
-	}
-}
-
-// Query executes a query and returns results
-func (s *PostgreSQLStorage) Query(ctx context.Context, query domain.Query) (domain.Result, error) {
-	sql, params, err := s.adapter.TranslateQuery(query)
-	if err != nil {
-		return nil, domain.NewQueryError("QUERY_TRANSLATION_FAILED", err.Error()).WithCause(err)
-	}
-
-	rows, err := s.pool.Query(ctx, sql, params...)
-	if err != nil {
-		return nil, domain.NewQueryError("QUERY_EXECUTION_FAILED", err.Error()).WithCause(err)
-	}
-
-	return &PostgreSQLResult{rows: rows}, nil
-}
-
-// QueryOne executes a query and returns a single row
-func (s *PostgreSQLStorage) QueryOne(ctx context.Context, query domain.Query) (domain.Row, error) {
-	sql, params, err := s.adapter.TranslateQuery(query)
-	if err != nil {
-		return nil, domain.NewQueryError("QUERY_TRANSLATION_FAILED", err.Error()).WithCause(err)
-	}
-
-	row := s.pool.QueryRow(ctx, sql, params...)
-	return &PostgreSQLRow{row: row}, nil
-}
-
-// Execute executes a command and returns the result
-func (s *PostgreSQLStorage) Execute(ctx context.Context, command domain.Command) (domain.ExecuteResult, error) {
-	sql, params, err := s.adapter.TranslateCommand(command)
-	if err != nil {
-		return domain.ExecuteResult{}, domain.NewQueryError("COMMAND_TRANSLATION_FAILED", err.Error()).WithCause(err)
-	}
-
-	result, err := s.pool.Exec(ctx, sql, params...)
-	if err != nil {
-		return domain.ExecuteResult{}, domain.NewQueryError("COMMAND_EXECUTION_FAILED", err.Error()).WithCause(err)
-	}
-
-	return domain.ExecuteResult{
-		RowsAffected: result.RowsAffected(),
-		LastInsertID: 0, // PostgreSQL doesn't support LastInsertID
-	}, nil
-}
-
-// BeginTx starts a new transaction
-func (s *PostgreSQLStorage) BeginTx(ctx context.Context, opts *domain.TxOptions) (domain.Transaction, error) {
-	var pgxOpts pgx.TxOptions
-
-	if opts != nil {
-		switch opts.Isolation {
-		case domain.IsolationLevelReadUncommitted:
-			pgxOpts.IsoLevel = pgx.ReadUncommitted
-		case domain.IsolationLevelReadCommitted:
-			pgxOpts.IsoLevel = pgx.ReadCommitted
-		case domain.IsolationLevelRepeatableRead:
-			pgxOpts.IsoLevel = pgx.RepeatableRead
-		case domain.IsolationLevelSerializable:
-			pgxOpts.IsoLevel = pgx.Serializable
-		default:
-			pgxOpts.IsoLevel = pgx.ReadCommitted
-		}
-
-		if opts.ReadOnly {
-			pgxOpts.AccessMode = pgx.ReadOnly
-		}
-	}
-
-	tx, err := s.pool.BeginTx(ctx, pgxOpts)
-	if err != nil {
-		return nil, domain.NewTransactionError("TRANSACTION_BEGIN_FAILED", err.Error()).WithCause(err)
-	}
-
-	return &PostgreSQLTransaction{
-		tx:      tx,
-		adapter: s.adapter,
-		id:      fmt.Sprintf("tx_%d", time.Now().UnixNano()),
-		active:  true,
-	}, nil
-}
-
-// Batch executes multiple operations in a batch
-func (s *PostgreSQLStorage) Batch(ctx context.Context, operations []domain.Operation) ([]domain.OperationResult, error) {
-	results := make([]domain.OperationResult, len(operations))
-
-	batch := &pgx.Batch{}
-
-	// Add all operations to the batch
-	for i, op := range operations {
-		switch op.Type {
-		case domain.OperationTypeQuery:
-			sql, params, err := s.adapter.TranslateQuery(op.Query)
-			if err != nil {
-				results[i] = domain.OperationResult{
-					Index: i,
-					Error: domain.NewQueryError("QUERY_TRANSLATION_FAILED", err.Error()).WithCause(err),
-				}
-				continue
-			}
-			batch.Queue(sql, params...)
-		case domain.OperationTypeCommand:
-			sql, params, err := s.adapter.TranslateCommand(op.Command)
-			if err != nil {
-				results[i] = domain.OperationResult{
-					Index: i,
-					Error: domain.NewQueryError("COMMAND_TRANSLATION_FAILED", err.Error()).WithCause(err),
-				}
-				continue
-			}
-			batch.Queue(sql, params...)
-		}
-	}
-
-	// Execute the batch
-	batchResults := s.pool.SendBatch(ctx, batch)
-	defer batchResults.Close()
-
-	// Process results
-	for i, op := range operations {
-		if results[i].Error != nil {
-			continue // Skip operations that failed translation
-		}
-
-		switch op.Type {
-		case domain.OperationTypeQuery:
-			rows, err := batchResults.Query()
-			if err != nil {
-				results[i] = domain.OperationResult{
-					Index: i,
-					Error: domain.NewQueryError("BATCH_QUERY_FAILED", err.Error()).WithCause(err),
-				}
-			} else {
-				results[i] = domain.OperationResult{
-					Index:  i,
-					Result: &PostgreSQLResult{rows: rows},
-				}
-			}
-		case domain.OperationTypeCommand:
-			cmdTag, err := batchResults.Exec()
-			if err != nil {
-				results[i] = domain.OperationResult{
-					Index: i,
-					Error: domain.NewQueryError("BATCH_COMMAND_FAILED", err.Error()).WithCause(err),
-				}
-			} else {
-				results[i] = domain.OperationResult{
-					Index: i,
-					Result: domain.ExecuteResult{
-						RowsAffected: cmdTag.RowsAffected(),
-						LastInsertID: 0,
-					},
-				}
-			}
-		}
-	}
-
-	return results, nil
-}
-
-// Schema operations
-func (s *PostgreSQLStorage) CreateTable(ctx context.Context, schema domain.TableSchema) error {
-	sql := s.buildCreateTableSQL(schema)
-	_, err := s.pool.Exec(ctx, sql)
-	if err != nil {
-		return domain.NewSchemaError("CREATE_TABLE_FAILED", err.Error()).WithCause(err)
-	}
-	return nil
-}
-
-func (s *PostgreSQLStorage) DropTable(ctx context.Context, tableName string) error {
-	sql := fmt.Sprintf("DROP TABLE IF EXISTS %s", tableName)
-	_, err := s.pool.Exec(ctx, sql)
-	if err != nil {
-		return domain.NewSchemaError("DROP_TABLE_FAILED", err.Error()).WithCause(err)
-	}
-	return nil
-}
-
-func (s *PostgreSQLStorage) AlterTable(ctx context.Context, tableName string, changes []domain.SchemaChange) error {
-	for _, change := range changes {
-		sql := s.buildAlterTableSQL(tableName, change)
-		if sql != "" {
-			_, err := s.pool.Exec(ctx, sql)
-			if err != nil {
-				return domain.NewSchemaError("ALTER_TABLE_FAILED", err.Error()).WithCause(err)
-			}
-		}
-	}
-	return nil
-}
-
-func (s *PostgreSQLStorage) ListTables(ctx context.Context) ([]string, error) {
-	sql := `SELECT table_name FROM information_schema.tables
-			WHERE table_schema = 'public' AND table_type = 'BASE TABLE'`
-
-	rows, err := s.pool.Query(ctx, sql)
-	if err != nil {
-		return nil, domain.NewSchemaError("LIST_TABLES_FAILED", err.Error()).WithCause(err)
-	}
-	defer rows.Close()
-
-	var tables []string
-	for rows.Next() {
-		var tableName string
-		if err := rows.Scan(&tableName); err != nil {
-			return nil, domain.NewSchemaError("SCAN_TABLE_NAME_FAILED", err.Error()).WithCause(err)
-		}
-		tables = append(tables, tableName)
-	}
-
-	return tables, nil
-}
-
-func (s *PostgreSQLStorage) DescribeTable(ctx context.Context, tableName string) (domain.TableSchema, error) {
-	schema := domain.TableSchema{
-		Name:    tableName,
-		Columns: []domain.ColumnDefinition{},
-	}
-
-	sql := `SELECT column_name, data_type, is_nullable, column_default, character_maximum_length
-			FROM information_schema.columns
-			WHERE table_name = $1 AND table_schema = 'public'
-			ORDER BY ordinal_position`
-
-	rows, err := s.pool.Query(ctx, sql, tableName)
-	if err != nil {
-		return schema, domain.NewSchemaError("DESCRIBE_TABLE_FAILED", err.Error()).WithCause(err)
-	}
-	defer rows.Close()
-
-	for rows.Next() {
-		var columnName, dataType, isNullable string
-		var columnDefault *string
-		var maxLength *int64
-
-		if err := rows.Scan(&columnName, &dataType, &isNullable, &columnDefault, &maxLength); err != nil {
-			return schema, domain.NewSchemaError("SCAN_COLUMN_FAILED", err.Error()).WithCause(err)
-		}
-
-		storageType, _ := s.adapter.MapDatabaseType(dataType)
-
-		column := domain.ColumnDefinition{
-			Name:     columnName,
-			DataType: storageType,
-			Nullable: isNullable == "YES",
-		}
-
-		if maxLength != nil {
-			column.Length = *maxLength
-		}
-
-		if columnDefault != nil {
-			column.DefaultValue = *columnDefault
-		}
-
-		schema.Columns = append(schema.Columns, column)
-	}
-
-	return schema, nil
-}
-
-// Helper methods for schema operations
-func (s *PostgreSQLStorage) buildCreateTableSQL(schema domain.TableSchema) string {
-	var parts []string
-	parts = append(parts, fmt.Sprintf("CREATE TABLE %s (", schema.Name))
-
-	var columnDefs []string
-	for _, col := range schema.Columns {
-		colDef := s.buildColumnDefinition(col)
-		columnDefs = append(columnDefs, colDef)
-	}
-
-	parts = append(parts, strings.Join(columnDefs, ", "))
-	parts = append(parts, ")")
-
-	return strings.Join(parts, "")
-}
-
-func (s *PostgreSQLStorage) buildColumnDefinition(col domain.ColumnDefinition) string {
-	var parts []string
-	parts = append(parts, col.Name)
-
-	// Map storage type to PostgreSQL type
-	pgType := s.mapStorageTypeToPostgreSQL(col.DataType, col.Length)
-	parts = append(parts, pgType)
-
-	if !col.Nullable {
-		parts = append(parts, "NOT NULL")
-	}
-
-	if col.DefaultValue != nil {
-		parts = append(parts, fmt.Sprintf("DEFAULT %v", col.DefaultValue))
-	}
-
-	if col.PrimaryKey {
-		parts = append(parts, "PRIMARY KEY")
-	}
-
-	if col.AutoIncrement {
-		parts = append(parts, "GENERATED ALWAYS AS IDENTITY")
-	}
-
-	return strings.Join(parts, " ")
-}
-
-func (s *PostgreSQLStorage) buildAlterTableSQL(tableName string, change domain.SchemaChange) string {
-	switch change.Type {
-	case domain.SchemaChangeTypeAddColumn:
-		colDef := s.buildColumnDefinition(change.Column)
-		return fmt.Sprintf("ALTER TABLE %s ADD COLUMN %s", tableName, colDef)
-	case domain.SchemaChangeTypeDropColumn:
-		return fmt.Sprintf("ALTER TABLE %s DROP COLUMN %s", tableName, change.Column.Name)
-	case domain.SchemaChangeTypeModifyColumn:
-		colDef := s.buildColumnDefinition(change.Column)
-		return fmt.Sprintf("ALTER TABLE %s ALTER COLUMN %s", tableName, colDef)
+// optionValue formats an Options value for the DSN.
+func optionValue(v interface{}) (string, error) {
+	switch x := v.(type) {
+	case string:
+		return x, nil
+	case time.Duration:
+		return x.String(), nil
+	case bool, int, int8, int16, int32, int64, uint, uint8, uint16, uint32, uint64, float32, float64:
+		return fmt.Sprint(x), nil
 	default:
-		return ""
-	}
-}
-
-func (s *PostgreSQLStorage) mapStorageTypeToPostgreSQL(dataType domain.DataType, length int64) string {
-	switch dataType {
-	case domain.DataTypeString:
-		if length > 0 {
-			return fmt.Sprintf("VARCHAR(%d)", length)
-		}
-		return "TEXT"
-	case domain.DataTypeInteger:
-		return "INTEGER"
-	case domain.DataTypeFloat:
-		return "DOUBLE PRECISION"
-	case domain.DataTypeBoolean:
-		return "BOOLEAN"
-	case domain.DataTypeDateTime:
-		return "TIMESTAMP"
-	case domain.DataTypeDate:
-		return "DATE"
-	case domain.DataTypeTime:
-		return "TIME"
-	case domain.DataTypeBinary:
-		return "BYTEA"
-	case domain.DataTypeJSON:
-		return "JSONB"
-	case domain.DataTypeUUID:
-		return "UUID"
-	case domain.DataTypeArray:
-		return "TEXT[]"
-	case domain.DataTypeDecimal:
-		return "DECIMAL"
-	case domain.DataTypeText:
-		return "TEXT"
-	default:
-		return "TEXT"
+		return "", fmt.Errorf("unsupported value type %T", v)
 	}
 }

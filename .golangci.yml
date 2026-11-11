@@ -1,267 +1,107 @@
-# golangci-lint configuration for Database Agnostic Storage Library
+# golangci-lint v2 configuration: https://golangci-lint.run/docs/configuration/
+# Run it with `make lint` (golangci-lint v2.15.0).
+#
+# A small, high-signal set for a library: bugs, error handling, security and a
+# few strong Go idioms. Linters that only enforce style are left out.
+version: "2"
 
 run:
-  timeout: 5m
-  issues-exit-code: 1
-  tests: true
-  skip-dirs:
-    - vendor
-    - .git
-    - bin
-    - dist
-  skip-files:
-    - ".*\\.pb\\.go$"
-    - ".*_generated\\.go$"
-
-output:
-  format: colored-line-number
-  print-issued-lines: true
-  print-linter-name: true
-  uniq-by-line: true
-  sort-results: true
-
-linters-settings:
-  # Cyclomatic complexity
-  cyclop:
-    max-complexity: 15
-    package-average: 10.0
-    skip-tests: true
-
-  # Duplicate code detection
-  dupl:
-    threshold: 100
-
-  # Error handling
-  errcheck:
-    check-type-assertions: true
-    check-blank: true
-    exclude-functions:
-      - (*database/sql.Rows).Close
-      - (*database/sql.Stmt).Close
-
-  # Function length
-  funlen:
-    lines: 100
-    statements: 50
-
-  # Cognitive complexity
-  gocognit:
-    min-complexity: 20
-
-  # Cyclomatic complexity
-  gocyclo:
-    min-complexity: 15
-
-  # Dot imports
-  goimports:
-    local-prefixes: github.com/HybridCache.io/storage
-
-  # Line length
-  lll:
-    line-length: 120
-
-  # Naming conventions
-  revive:
-    rules:
-      - name: exported
-        arguments: [checkPrivateReceivers, sayRepetitiveInsteadOfStutters]
-      - name: package-comments
-      - name: var-naming
-      - name: function-result-limit
-        arguments: [3]
-      - name: argument-limit
-        arguments: [5]
-      - name: function-length
-        arguments: [50, 100]
-      - name: max-public-structs
-        arguments: [10]
-
-  # Unused code
-  unused:
-    check-exported: false
-
-  # Whitespace
-  wsl:
-    strict-append: true
-    allow-assign-and-call: true
-    allow-multiline-assign: true
-    allow-case-trailing-whitespace: true
-    allow-cuddle-declarations: false
-
-  # Govet
-  govet:
-    check-shadowing: true
-    enable-all: true
-    disable:
-      - fieldalignment # Can be too strict for readability
-
-  # Staticcheck
-  staticcheck:
-    go: "1.19"
-    checks: ["all"]
-
-  # Gosec
-  gosec:
-    severity: medium
-    confidence: medium
-    excludes:
-      - G104 # Audit errors not checked (we handle this with errcheck)
-
-  # Gocritic
-  gocritic:
-    enabled-tags:
-      - diagnostic
-      - experimental
-      - opinionated
-      - performance
-      - style
-    disabled-checks:
-      - dupImport
-      - ifElseChain
-      - octalLiteral
-      - whyNoLint
-      - wrapperFunc
+  # Lint the integration tests too; they are behind this build tag.
+  build-tags:
+    - integration
 
 linters:
+  default: none
   enable:
-    # Enabled by default
-    - errcheck
-    - gosimple
-    - govet
-    - ineffassign
-    - staticcheck
-    - typecheck
-    - unused
+    - errcheck # unchecked errors
+    - errorlint # error comparisons and wrapping that defeat errors.Is/As
+    - gocritic # diagnostic checks only (see settings)
+    - gosec # security problems
+    - govet # go vet, plus nilness and unusedwrite
+    - ineffassign # assignments whose value is never used
+    - misspell # misspelled English words
+    - revive # a few idioms staticcheck does not cover (see settings)
+    - staticcheck # bugs, simplifications and selected style checks
+    - unconvert # unnecessary type conversions
+    - unused # unused code
 
-    # Additional linters
-    - asciicheck
-    - bidichk
-    - bodyclose
-    - contextcheck
-    - cyclop
-    - dupl
-    - durationcheck
-    - errname
-    - errorlint
-    - execinquery
-    - exhaustive
-    - exportloopref
-    - forbidigo
-    - funlen
-    - gochecknoglobals
-    - gochecknoinits
-    - gocognit
-    - goconst
-    - gocritic
-    - gocyclo
-    - godot
-    - gofmt
-    - gofumpt
-    - goheader
-    - goimports
-    - gomnd
-    - gomoddirectives
-    - gomodguard
-    - goprintffuncname
-    - gosec
-    - grouper
-    - importas
-    - lll
-    - makezero
-    - misspell
-    - nakedret
-    - nestif
-    - nilerr
-    - nilnil
-    - noctx
-    - nolintlint
-    - prealloc
-    - predeclared
-    - promlinter
-    - revive
-    - rowserrcheck
-    - sqlclosecheck
-    - stylecheck
-    - tenv
-    - testpackage
-    - thelper
-    - tparallel
-    - unconvert
-    - unparam
-    - usestdlibvars
-    - wastedassign
-    - whitespace
-    - wsl
+  settings:
+    errcheck:
+      # Also report x.(T) without the ok result, which panics on a mismatch.
+      check-type-assertions: true
 
-  disable:
-    - deadcode    # deprecated
-    - exhaustivestruct # deprecated
-    - golint      # deprecated
-    - ifshort     # deprecated
-    - interfacer  # deprecated
-    - maligned    # deprecated
-    - nosnakecase # deprecated
-    - scopelint   # deprecated
-    - structcheck # deprecated
-    - varcheck    # deprecated
+    gocritic:
+      # Exactly the checks tagged "diagnostic" (likely bugs), none of the
+      # style, performance or opinionated ones.
+      disable-all: true
+      enabled-tags:
+        - diagnostic
+
+    gosec:
+      excludes:
+        - G104 # unhandled errors: errcheck reports these
+
+    govet:
+      enable:
+        - nilness
+        - unusedwrite
+
+    revive:
+      # Only these rules run. Rules that duplicate staticcheck or go vet
+      # (error-strings, error-naming, error-return, errorf, dot-imports,
+      # context-keys-type, time-naming, unreachable-code, empty-block) are
+      # omitted.
+      rules:
+        - name: blank-imports
+        - name: context-as-argument
+          arguments:
+            - allowTypesBefore: "*testing.T,*testing.B,testing.TB"
+        - name: defer
+        - name: receiver-naming
+        - name: redefines-builtin-id
+        - name: unexported-return
+        - name: var-naming
+
+    staticcheck:
+      checks:
+        - all
+        - -ST1000 # package comments
+        - -ST1003 # initialisms in names (revive var-naming covers naming)
+        - -ST1016 # consistent receiver names (revive receiver-naming)
+        - -ST1020 # comment form on exported functions
+        - -ST1021 # comment form on exported types
+        - -ST1022 # comment form on exported variables
+        - -QF* # quick-fix refactoring suggestions
+
+  exclusions:
+    presets:
+      - common-false-positives
+      - std-error-handling
+    rules:
+      - path: _test\.go
+        linters:
+          - errcheck
+      - path: _test\.go
+        linters:
+          - gosec
+        text: "G(101|404):" # test credentials; math/rand in tests
+      - path: ^(cmd|examples)/
+        linters:
+          - gosec
+        text: "G101:" # the examples' local development credentials
 
 issues:
-  exclude-rules:
-    # Exclude some linters from running on tests files
-    - path: _test\.go
-      linters:
-        - gocyclo
-        - errcheck
-        - dupl
-        - gosec
-        - funlen
-        - gocognit
-        - cyclop
-
-    # Exclude some staticcheck messages
-    - linters:
-        - staticcheck
-      text: "SA9003:"
-
-    # Exclude lll issues for long lines with go:generate
-    - linters:
-        - lll
-      source: "^//go:generate "
-
-    # Exclude shadow checking on err variables
-    - linters:
-        - govet
-      text: 'shadow: declaration of "err"'
-
-    # Exclude certain gosec rules
-    - linters:
-        - gosec
-      text: "G204:"  # Subprocess launched with variable
-      path: _test\.go
-
-    # Exclude magic number detection in tests
-    - linters:
-        - gomnd
-      path: _test\.go
-
-    # Exclude package comment requirement for main packages
-    - linters:
-        - revive
-      text: "package-comments"
-      path: cmd/
-
-  exclude-use-default: false
+  # Report everything instead of the default 50 per linter / 3 per message.
   max-issues-per-linter: 0
   max-same-issues: 0
-  new: false
 
-severity:
-  default-severity: error
-  case-sensitive: false
-  rules:
-    - linters:
-        - dupl
-      severity: info
-    - linters:
-        - gocritic
-      severity: warning
+formatters:
+  enable:
+    - gofmt
+    - goimports
+  settings:
+    gofmt:
+      simplify: true
+    goimports:
+      local-prefixes:
+        - github.com/AnandSGit/HybridCache.io

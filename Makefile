@@ -1,232 +1,114 @@
-# Database Agnostic Storage Library Makefile
+# Makefile for the HybridCache.io Go module.
+#
+# `make` (or `make help`) lists the targets. The Python package has its own
+# Makefile in python/; the py-<target> targets run it from here.
 
-# Go parameters
-GOCMD=go
-GOBUILD=$(GOCMD) build
-GOCLEAN=$(GOCMD) clean
-GOTEST=$(GOCMD) test
-GOGET=$(GOCMD) get
-GOMOD=$(GOCMD) mod
-GOFMT=gofmt
-GOLINT=golangci-lint
+.DEFAULT_GOAL := help
 
-# Project parameters
-BINARY_NAME=storage
-BINARY_UNIX=$(BINARY_NAME)_unix
-MAIN_PATH=./cmd/example
-PKG_LIST=$$(go list ./... | grep -v /vendor/)
+GO             ?= go
+GOFMT          ?= gofmt
+DOCKER_COMPOSE ?= docker compose
 
-# Build flags
-BUILD_FLAGS=-v
-TEST_FLAGS=-v -race -coverprofile=coverage.out
-LINT_FLAGS=run --timeout=5m
+# The linters run through `go run pkg@version`, which builds them outside this
+# module and never edits go.mod or go.sum. Set GOLANGCI_LINT=golangci-lint to
+# use an installed golangci-lint v2 binary instead.
+GOLANGCI_LINT_VERSION ?= v2.15.0
+GOLANGCI_LINT         ?= $(GO) run github.com/golangci/golangci-lint/v2/cmd/golangci-lint@$(GOLANGCI_LINT_VERSION)
+GOVULNCHECK           ?= $(GO) run golang.org/x/vuln/cmd/govulncheck@latest
 
-# Docker parameters
-DOCKER_COMPOSE=docker-compose
-COMPOSE_FILE=docker-compose.yml
+# Connection strings for test-integration and run-examples. The defaults match
+# docker-compose.yml; override them in the environment or on the command line.
+POSTGRES_DSN ?= postgres://testuser:testpass@localhost:5432/testdb?sslmode=disable
+MONGODB_URI  ?= mongodb://localhost:27017/?replicaSet=rs0&directConnection=true
 
-.PHONY: all build clean test test-coverage test-integration lint fmt deps deps-update help
+COVERAGE_PROFILE ?= coverage.out
+COVERPKG         := ./internal/...,./pkg/...
 
-# Default target
-all: clean deps fmt lint test build
+# The repository's Go files: tracked, or new and not ignored.
+GO_FILES = $(wildcard $(shell git ls-files --cached --others --exclude-standard -- '*.go'))
 
-# Build the binary
-build:
-	@echo "Building..."
-	$(GOBUILD) $(BUILD_FLAGS) -o $(BINARY_NAME) $(MAIN_PATH)
+# Every directory under cmd/ or examples/ that holds a main.go.
+EXAMPLE_DIRS = $(sort $(patsubst %/main.go,%,$(wildcard cmd/*/main.go examples/*/main.go)))
 
-# Build for Linux
-build-linux:
-	@echo "Building for Linux..."
-	CGO_ENABLED=0 GOOS=linux GOARCH=amd64 $(GOBUILD) $(BUILD_FLAGS) -o $(BINARY_UNIX) $(MAIN_PATH)
+# Targets of python/Makefile that are available here as py-<target>.
+PY_TARGETS := install-dev test test-unit test-integration lint format type-check coverage
+PY_GOALS   := $(addprefix py-,$(PY_TARGETS))
 
-# Clean build artifacts
-clean:
-	@echo "Cleaning..."
-	$(GOCLEAN)
-	rm -f $(BINARY_NAME)
-	rm -f $(BINARY_UNIX)
-	rm -f coverage.out
-	rm -f coverage.html
+.PHONY: help build vet fmt fmt-check test test-integration coverage lint vuln \
+	tidy check dev-up dev-down run-examples clean $(PY_GOALS)
 
-# Run tests
-test:
-	@echo "Running unit tests..."
-	$(GOTEST) $(TEST_FLAGS) ./...
+help: ## Show this help
+	@echo "Usage: make <target> [VARIABLE=value ...]"
+	@echo
+	@awk 'BEGIN { FS = ":.*## " } /^[a-z][a-z-]*:.*## / { printf "  %-17s %s\n", $$1, $$2 }' $(firstword $(MAKEFILE_LIST))
+	@printf '  %-17s %s\n' 'py-<target>' 'Run make <target> in python/, for: $(PY_TARGETS)'
+	@echo
+	@echo "Variables: POSTGRES_DSN and MONGODB_URI (default to the docker-compose.yml"
+	@echo "databases), GOLANGCI_LINT, DOCKER_COMPOSE, COVERAGE_PROFILE."
 
-# Run tests with coverage
-test-coverage: test
-	@echo "Generating coverage report..."
-	$(GOCMD) tool cover -html=coverage.out -o coverage.html
-	@echo "Coverage report generated: coverage.html"
+build: ## Compile every package (writes no binaries)
+	$(GO) build ./...
 
-# Run integration tests
-test-integration:
-	@echo "Starting test databases..."
-	$(DOCKER_COMPOSE) -f $(COMPOSE_FILE) up -d
-	@echo "Waiting for databases to be ready..."
-	sleep 10
-	@echo "Running integration tests..."
-	$(GOTEST) $(TEST_FLAGS) -tags=integration ./...
-	@echo "Stopping test databases..."
-	$(DOCKER_COMPOSE) -f $(COMPOSE_FILE) down
+vet: ## Run go vet, including the files behind the integration build tag
+	$(GO) vet -tags integration ./...
 
-# Run benchmarks
-benchmark:
-	@echo "Running benchmarks..."
-	$(GOTEST) -bench=. -benchmem ./...
+fmt: ## Format the Go files with gofmt -s (lists the files it changed)
+	@files="$(GO_FILES)"; \
+	test -n "$$files" || { echo "fmt: no Go files found" >&2; exit 1; }; \
+	$(GOFMT) -s -l -w $$files
 
-# Lint the code
-lint:
-	@echo "Running linter..."
-	$(GOLINT) $(LINT_FLAGS) ./...
+fmt-check: ## Fail if a Go file is not gofmt -s formatted or does not parse
+	@files="$(GO_FILES)"; \
+	test -n "$$files" || { echo "fmt-check: no Go files found" >&2; exit 1; }; \
+	unformatted="$$($(GOFMT) -s -l $$files)"; status=$$?; \
+	if [ -n "$$unformatted" ]; then \
+		echo "Not gofmt -s formatted (run 'make fmt'):"; \
+		echo "$$unformatted"; \
+	fi; \
+	[ "$$status" -eq 0 ] && [ -z "$$unformatted" ]
 
-# Format the code
-fmt:
-	@echo "Formatting code..."
-	$(GOFMT) -s -w .
+test: ## Run the unit tests with the race detector
+	$(GO) test -race -count=1 ./...
 
-# Check formatting
-fmt-check:
-	@echo "Checking code formatting..."
-	@if [ -n "$$($(GOFMT) -l .)" ]; then \
-		echo "Code is not formatted. Run 'make fmt' to fix."; \
-		$(GOFMT) -l .; \
-		exit 1; \
-	fi
+test-integration: export POSTGRES_DSN := $(POSTGRES_DSN)
+test-integration: export MONGODB_URI := $(MONGODB_URI)
+test-integration: ## Run the integration tests against POSTGRES_DSN and MONGODB_URI (make dev-up first)
+	$(GO) test -tags integration -race -count=1 ./...
 
-# Download dependencies
-deps:
-	@echo "Downloading dependencies..."
-	$(GOMOD) download
-	$(GOMOD) tidy
+coverage: ## Unit-test coverage of ./internal/... and ./pkg/... (writes coverage.out)
+	$(GO) test -count=1 -coverpkg=$(COVERPKG) -coverprofile=$(COVERAGE_PROFILE) ./...
+	$(GO) tool cover -func=$(COVERAGE_PROFILE)
 
-# Update dependencies
-deps-update:
-	@echo "Updating dependencies..."
-	$(GOMOD) get -u ./...
-	$(GOMOD) tidy
+lint: ## Run golangci-lint v2 with .golangci.yml
+	$(GOLANGCI_LINT) run ./...
 
-# Verify dependencies
-deps-verify:
-	@echo "Verifying dependencies..."
-	$(GOMOD) verify
+vuln: ## Check dependencies for known vulnerabilities with govulncheck
+	$(GOVULNCHECK) ./...
 
-# Install development tools
-install-tools:
-	@echo "Installing development tools..."
-	$(GOGET) github.com/golangci/golangci-lint/cmd/golangci-lint@latest
+tidy: ## Run go mod tidy
+	$(GO) mod tidy
 
-# Start development environment
-dev-up:
-	@echo "Starting development environment..."
-	$(DOCKER_COMPOSE) -f $(COMPOSE_FILE) up -d
+check: fmt-check vet lint test ## Run fmt-check, vet, lint and test
 
-# Stop development environment
-dev-down:
-	@echo "Stopping development environment..."
-	$(DOCKER_COMPOSE) -f $(COMPOSE_FILE) down
+dev-up: ## Start PostgreSQL and MongoDB (docker-compose.yml) and wait until they are healthy
+	$(DOCKER_COMPOSE) up -d --wait
 
-# View development environment logs
-dev-logs:
-	@echo "Viewing development environment logs..."
-	$(DOCKER_COMPOSE) -f $(COMPOSE_FILE) logs -f
+dev-down: ## Stop the dev databases (their data volumes are kept)
+	$(DOCKER_COMPOSE) down
 
-# Run example application
-run-example:
-	@echo "Running example application..."
-	$(GOCMD) run $(MAIN_PATH)/main.go
+run-examples: export POSTGRES_DSN := $(POSTGRES_DSN)
+run-examples: export MONGODB_URI := $(MONGODB_URI)
+run-examples: ## Run each example program with go run (make dev-up first)
+	@set -e; for dir in $(EXAMPLE_DIRS); do \
+		echo "$(GO) run ./$$dir"; \
+		$(GO) run ./$$dir; \
+	done
 
-# Generate documentation
-docs:
-	@echo "Generating documentation..."
-	$(GOCMD) doc -all ./pkg/storage > docs/api-reference.md
+clean: ## Remove the coverage profile
+	rm -f $(COVERAGE_PROFILE)
 
-# Security scan
-security:
-	@echo "Running security scan..."
-	$(GOGET) github.com/securecodewarrior/gosec/v2/cmd/gosec@latest
-	gosec ./...
-
-# Check for vulnerabilities
-vuln-check:
-	@echo "Checking for vulnerabilities..."
-	$(GOGET) golang.org/x/vuln/cmd/govulncheck@latest
-	govulncheck ./...
-
-# Run all quality checks
-quality: fmt-check lint test vuln-check
-	@echo "All quality checks passed!"
-
-# Release preparation
-release-prep: clean deps quality test-integration
-	@echo "Release preparation complete!"
-
-# Docker build
-docker-build:
-	@echo "Building Docker image..."
-	docker build -t hybridcache/storage:latest .
-
-# Docker run
-docker-run:
-	@echo "Running Docker container..."
-	docker run --rm -it hybridcache/storage:latest
-
-# Performance profiling
-profile-cpu:
-	@echo "Running CPU profiling..."
-	$(GOTEST) -cpuprofile=cpu.prof -bench=. ./...
-	$(GOCMD) tool pprof cpu.prof
-
-profile-mem:
-	@echo "Running memory profiling..."
-	$(GOTEST) -memprofile=mem.prof -bench=. ./...
-	$(GOCMD) tool pprof mem.prof
-
-# Database operations
-db-migrate-up:
-	@echo "Running database migrations..."
-	$(GOCMD) run ./cmd/migrate up
-
-db-migrate-down:
-	@echo "Rolling back database migrations..."
-	$(GOCMD) run ./cmd/migrate down
-
-db-seed:
-	@echo "Seeding database with test data..."
-	$(GOCMD) run ./cmd/seed
-
-# Help
-help:
-	@echo "Available targets:"
-	@echo "  build           - Build the binary"
-	@echo "  build-linux     - Build for Linux"
-	@echo "  clean           - Clean build artifacts"
-	@echo "  test            - Run unit tests"
-	@echo "  test-coverage   - Run tests with coverage report"
-	@echo "  test-integration- Run integration tests"
-	@echo "  benchmark       - Run benchmarks"
-	@echo "  lint            - Run linter"
-	@echo "  fmt             - Format code"
-	@echo "  fmt-check       - Check code formatting"
-	@echo "  deps            - Download dependencies"
-	@echo "  deps-update     - Update dependencies"
-	@echo "  deps-verify     - Verify dependencies"
-	@echo "  install-tools   - Install development tools"
-	@echo "  dev-up          - Start development environment"
-	@echo "  dev-down        - Stop development environment"
-	@echo "  dev-logs        - View development environment logs"
-	@echo "  run-example     - Run example application"
-	@echo "  docs            - Generate documentation"
-	@echo "  security        - Run security scan"
-	@echo "  vuln-check      - Check for vulnerabilities"
-	@echo "  quality         - Run all quality checks"
-	@echo "  release-prep    - Prepare for release"
-	@echo "  docker-build    - Build Docker image"
-	@echo "  docker-run      - Run Docker container"
-	@echo "  profile-cpu     - Run CPU profiling"
-	@echo "  profile-mem     - Run memory profiling"
-	@echo "  db-migrate-up   - Run database migrations"
-	@echo "  db-migrate-down - Roll back database migrations"
-	@echo "  db-seed         - Seed database with test data"
-	@echo "  help            - Show this help message"
+# python/Makefile answers unknown targets with exit status 0, so check that the
+# target exists before delegating.
+$(PY_GOALS): py-%:
+	@grep -Eq '^$*:' python/Makefile || { echo "python/Makefile has no '$*' target" >&2; exit 1; }
+	$(MAKE) -C python $*

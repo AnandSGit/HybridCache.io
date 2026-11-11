@@ -83,10 +83,10 @@ go run main.go
 
 ```go
 // Build query
-query := query.NewBuilder().
+query := storage.NewBuilder().
     Select("id", "name", "email").
     From("users").
-    Where(query.Equal("active", true)).
+    Where(storage.Equal("active", true)).
     OrderBy("name", storage.SortDirectionAsc).
     Limit(10)
 
@@ -116,7 +116,7 @@ for result.Next() {
 
 ```go
 // Build command
-cmd := query.Insert("users").
+cmd := storage.Insert("users").
     Set("name", "John Doe").
     Set("email", "john@example.com").
     Set("age", 30).
@@ -150,13 +150,11 @@ if err != nil {
 defer tx.Rollback() // Ensure rollback if not committed
 
 // Execute operations within transaction
-result1, err := tx.Execute(ctx, command1)
-if err != nil {
+if _, err := tx.Execute(ctx, command1); err != nil {
     return err
 }
 
-result2, err := tx.Execute(ctx, command2)
-if err != nil {
+if _, err := tx.Execute(ctx, command2); err != nil {
     return err
 }
 
@@ -246,7 +244,7 @@ config := storage.Config{
 ### Structured Error Handling
 
 ```go
-result, err := store.Execute(ctx, command)
+_, err := store.Execute(ctx, command)
 if err != nil {
     // Check for specific error types
     if storage.IsConnectionError(err) {
@@ -274,7 +272,7 @@ if err != nil {
 ```go
 func executeWithRetry(ctx context.Context, store storage.Storage, command storage.Command, maxRetries int) error {
     for attempt := 0; attempt <= maxRetries; attempt++ {
-        result, err := store.Execute(ctx, command)
+        _, err := store.Execute(ctx, command)
         if err == nil {
             return nil
         }

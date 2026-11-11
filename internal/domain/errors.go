@@ -50,21 +50,49 @@ var (
 	ErrUnsupportedAdapter = errors.New("unsupported adapter")
 	ErrAdapterFailed      = errors.New("adapter failed")
 
-	// Migration errors
-	ErrMigrationFailed   = errors.New("migration failed")
-	ErrMigrationNotFound = errors.New("migration not found")
-	ErrInvalidMigration  = errors.New("invalid migration")
-
-	// Cache errors
-	ErrCacheNotFound = errors.New("cache entry not found")
-	ErrCacheFailed   = errors.New("cache operation failed")
-	ErrCacheTimeout  = errors.New("cache timeout")
-
 	// Generic errors
 	ErrNotImplemented       = errors.New("not implemented")
 	ErrUnsupportedOperation = errors.New("unsupported operation")
 	ErrInternalError        = errors.New("internal error")
 )
+
+// codeSentinels links StorageError codes to the sentinel errors above so that
+// errors.Is(err, ErrNoRows) works for errors created with NewNoRowsError and friends.
+var codeSentinels = map[string]error{
+	"CONNECTION_FAILED":     ErrConnectionFailed,
+	"CONNECTION_TIMEOUT":    ErrConnectionTimeout,
+	"CONNECTION_CLOSED":     ErrConnectionClosed,
+	"CONNECTION_POOL_FULL":  ErrConnectionPoolFull,
+	"INVALID_DSN":           ErrInvalidDSN,
+	"INVALID_CONFIG":        ErrInvalidConfig,
+	"INVALID_QUERY":         ErrInvalidQuery,
+	"QUERY_TIMEOUT":         ErrQueryTimeout,
+	"QUERY_FAILED":          ErrQueryFailed,
+	"INVALID_PARAMETERS":    ErrInvalidParameters,
+	"UNSUPPORTED_QUERY":     ErrUnsupportedQuery,
+	"TRANSACTION_FAILED":    ErrTransactionFailed,
+	"TRANSACTION_TIMEOUT":   ErrTransactionTimeout,
+	"TRANSACTION_CLOSED":    ErrTransactionClosed,
+	"INVALID_TRANSACTION":   ErrInvalidTransaction,
+	"DEADLOCK":              ErrDeadlock,
+	"NO_ROWS":               ErrNoRows,
+	"TOO_MANY_ROWS":         ErrTooManyRows,
+	"INVALID_DATA":          ErrInvalidData,
+	"DATA_TRUNCATED":        ErrDataTruncated,
+	"CONSTRAINT_VIOLATION":  ErrConstraintViolation,
+	"DUPLICATE_KEY":         ErrDuplicateKey,
+	"TABLE_NOT_FOUND":       ErrTableNotFound,
+	"COLUMN_NOT_FOUND":      ErrColumnNotFound,
+	"INDEX_NOT_FOUND":       ErrIndexNotFound,
+	"INVALID_SCHEMA":        ErrInvalidSchema,
+	"SCHEMA_EXISTS":         ErrSchemaExists,
+	"ADAPTER_NOT_FOUND":     ErrAdapterNotFound,
+	"UNSUPPORTED_ADAPTER":   ErrUnsupportedAdapter,
+	"ADAPTER_FAILED":        ErrAdapterFailed,
+	"NOT_IMPLEMENTED":       ErrNotImplemented,
+	"UNSUPPORTED_OPERATION": ErrUnsupportedOperation,
+	"INTERNAL_ERROR":        ErrInternalError,
+}
 
 // ErrorType represents the category of error
 type ErrorType int
@@ -77,8 +105,6 @@ const (
 	ErrorTypeData
 	ErrorTypeSchema
 	ErrorTypeAdapter
-	ErrorTypeMigration
-	ErrorTypeCache
 	ErrorTypeValidation
 	ErrorTypeTimeout
 	ErrorTypePermission
@@ -99,10 +125,6 @@ func (et ErrorType) String() string {
 		return "schema"
 	case ErrorTypeAdapter:
 		return "adapter"
-	case ErrorTypeMigration:
-		return "migration"
-	case ErrorTypeCache:
-		return "cache"
 	case ErrorTypeValidation:
 		return "validation"
 	case ErrorTypeTimeout:
@@ -140,7 +162,9 @@ func (e *StorageError) Unwrap() error {
 	return e.Cause
 }
 
-// Is checks if the error matches the target error
+// Is reports whether the error matches target: another StorageError with the same
+// Type and Code, the sentinel error associated with this error's Code, or (via
+// errors.Is) the underlying cause.
 func (e *StorageError) Is(target error) bool {
 	if target == nil {
 		return false
@@ -148,6 +172,10 @@ func (e *StorageError) Is(target error) bool {
 
 	if se, ok := target.(*StorageError); ok {
 		return e.Type == se.Type && e.Code == se.Code
+	}
+
+	if sentinel, ok := codeSentinels[e.Code]; ok && sentinel == target {
+		return true
 	}
 
 	return errors.Is(e.Cause, target)
@@ -211,6 +239,10 @@ func NewInvalidQueryError(message string) *StorageError {
 	return NewStorageError(ErrorTypeValidation, "INVALID_QUERY", message)
 }
 
+func NewUnsupportedQueryError(message string) *StorageError {
+	return NewStorageError(ErrorTypeQuery, "UNSUPPORTED_QUERY", message)
+}
+
 // Transaction error constructors
 func NewTransactionError(code, message string) *StorageError {
 	return NewStorageError(ErrorTypeTransaction, code, message)
@@ -220,6 +252,10 @@ func NewDeadlockError() *StorageError {
 	return NewStorageError(ErrorTypeTransaction, "DEADLOCK", "deadlock detected").
 		WithRetryable(true).
 		WithTemporary(true)
+}
+
+func NewTransactionClosedError() *StorageError {
+	return NewStorageError(ErrorTypeTransaction, "TRANSACTION_CLOSED", "transaction is not active")
 }
 
 func NewTransactionTimeoutError() *StorageError {
@@ -272,25 +308,9 @@ func NewUnsupportedAdapterError(adapter string) *StorageError {
 		WithContext("adapter", adapter)
 }
 
-// Migration error constructors
-func NewMigrationError(code, message string) *StorageError {
-	return NewStorageError(ErrorTypeMigration, code, message)
-}
-
-func NewMigrationFailedError(migration string, cause error) *StorageError {
-	return NewStorageError(ErrorTypeMigration, "MIGRATION_FAILED", "migration failed").
-		WithContext("migration", migration).
-		WithCause(cause)
-}
-
-// Cache error constructors
-func NewCacheError(code, message string) *StorageError {
-	return NewStorageError(ErrorTypeCache, code, message)
-}
-
-func NewCacheNotFoundError(key string) *StorageError {
-	return NewStorageError(ErrorTypeCache, "CACHE_NOT_FOUND", "cache entry not found").
-		WithContext("key", key)
+func NewUnsupportedOperationError(operation string) *StorageError {
+	return NewStorageError(ErrorTypeAdapter, "UNSUPPORTED_OPERATION", "operation not supported by this adapter").
+		WithContext("operation", operation)
 }
 
 // Helper methods for StorageError
@@ -306,58 +326,44 @@ func (e *StorageError) WithTemporary(temporary bool) *StorageError {
 
 // IsRetryable checks if an error is retryable
 func IsRetryable(err error) bool {
-	if se, ok := err.(*StorageError); ok {
-		return se.Retryable
-	}
-	return false
+	var se *StorageError
+	return errors.As(err, &se) && se.Retryable
 }
 
 // IsTemporary checks if an error is temporary
 func IsTemporary(err error) bool {
-	if se, ok := err.(*StorageError); ok {
-		return se.Temporary
-	}
-	return false
+	var se *StorageError
+	return errors.As(err, &se) && se.Temporary
 }
 
 // IsConnectionError checks if an error is a connection error
 func IsConnectionError(err error) bool {
-	if se, ok := err.(*StorageError); ok {
-		return se.Type == ErrorTypeConnection
-	}
-	return false
+	var se *StorageError
+	return errors.As(err, &se) && se.Type == ErrorTypeConnection
 }
 
 // IsQueryError checks if an error is a query error
 func IsQueryError(err error) bool {
-	if se, ok := err.(*StorageError); ok {
-		return se.Type == ErrorTypeQuery
-	}
-	return false
+	var se *StorageError
+	return errors.As(err, &se) && se.Type == ErrorTypeQuery
 }
 
 // IsTransactionError checks if an error is a transaction error
 func IsTransactionError(err error) bool {
-	if se, ok := err.(*StorageError); ok {
-		return se.Type == ErrorTypeTransaction
-	}
-	return false
+	var se *StorageError
+	return errors.As(err, &se) && se.Type == ErrorTypeTransaction
 }
 
 // IsDataError checks if an error is a data error
 func IsDataError(err error) bool {
-	if se, ok := err.(*StorageError); ok {
-		return se.Type == ErrorTypeData
-	}
-	return false
+	var se *StorageError
+	return errors.As(err, &se) && se.Type == ErrorTypeData
 }
 
 // IsTimeoutError checks if an error is a timeout error
 func IsTimeoutError(err error) bool {
-	if se, ok := err.(*StorageError); ok {
-		return se.Type == ErrorTypeTimeout
-	}
-	return false
+	var se *StorageError
+	return errors.As(err, &se) && se.Type == ErrorTypeTimeout
 }
 
 // WrapError wraps an existing error as a StorageError

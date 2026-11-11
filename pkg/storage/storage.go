@@ -1,12 +1,56 @@
-// Package storage provides the public API for the Database Agnostic Storage Library.
-// This package exposes the core interfaces and types needed by client applications.
+// Package storage is the public API of HybridCache.io, a database-agnostic
+// storage library. It is the package applications import: it re-exports the
+// library's interfaces, types, constants and errors, and provides the query
+// builder and the adapter factories.
+//
+// Connect through an adapter, then build queries and commands with NewBuilder,
+// Insert, Update and Delete and run them on the returned Storage:
+//
+//	adapter := storage.NewPostgreSQLAdapter() // or storage.NewMongoDBAdapter()
+//	config, err := adapter.ParseDSN(os.Getenv("POSTGRES_DSN"))
+//	if err != nil {
+//		return err
+//	}
+//	store, err := adapter.Connect(ctx, config)
+//	if err != nil {
+//		return err
+//	}
+//	defer store.Close()
+//
+//	query, err := storage.NewBuilder().
+//		Select("id", "name").
+//		From("users").
+//		Where(storage.Equal("active", true)).
+//		OrderByAsc("name").
+//		Page(1, 20).
+//		Build()
+//	if err != nil {
+//		return err
+//	}
+//	rows, err := store.Query(ctx, query)
+//
+// Builders produce both SQL (with '?' placeholders) and a structured Spec, so
+// the same query runs on SQL and document databases. An adapter reports what
+// it cannot run, such as a join on MongoDB, with an error matching
+// ErrUnsupportedQuery.
+//
+// Errors are *StorageError values that match the sentinel errors (ErrNoRows,
+// ErrDuplicateKey, ...) with errors.Is. Depending on the adapter, a query
+// without rows is reported by QueryOne itself or by the returned Row, so check
+// both:
+//
+//	row, err := store.QueryOne(ctx, query)
+//	if err == nil {
+//		err = row.Scan(&id, &name)
+//	}
+//	if errors.Is(err, storage.ErrNoRows) {
+//		// not found
+//	}
 package storage
 
 import (
 	"github.com/AnandSGit/HybridCache.io/internal/domain"
 )
-
-// Re-export core domain types and interfaces for public use
 
 // Core interfaces
 type (
@@ -18,42 +62,55 @@ type (
 	Row          = domain.Row
 )
 
-// Core types
+// Queries, commands and their results
 type (
-	DatabaseType       = domain.DatabaseType
-	DataType           = domain.DataType
-	Query              = domain.Query
-	Command            = domain.Command
-	Config             = domain.Config
-	StorageInfo        = domain.StorageInfo
-	HealthStatus       = domain.HealthStatus
-	TableSchema        = domain.TableSchema
-	ColumnDefinition   = domain.ColumnDefinition
-	IndexDefinition    = domain.IndexDefinition
-	TxOptions          = domain.TxOptions
-	IsolationLevel     = domain.IsolationLevel
-	SortDirection      = domain.SortDirection
-	QueryType          = domain.QueryType
-	CommandType        = domain.CommandType
-	OperationType      = domain.OperationType
-	Operation          = domain.Operation
-	OperationResult    = domain.OperationResult
-	ExecuteResult      = domain.ExecuteResult
-	ColumnType         = domain.ColumnType
-	Condition          = domain.Condition
-	Operator           = domain.Operator
-	JoinType           = domain.JoinType
-	ConflictResolution = domain.ConflictResolution
-	SchemaChange       = domain.SchemaChange
-	SchemaChangeType   = domain.SchemaChangeType
-	IndexType          = domain.IndexType
-	HealthStatusType   = domain.HealthStatusType
-	ErrorType          = domain.ErrorType
-	Field              = domain.Field
-	CacheStats         = domain.CacheStats
-	CacheHealth        = domain.CacheHealth
-	StorageLimits      = domain.StorageLimits
-	PoolStats          = domain.PoolStats
+	Query           = domain.Query
+	QueryType       = domain.QueryType
+	QueryOptions    = domain.QueryOptions
+	QuerySpec       = domain.QuerySpec
+	OrderBy         = domain.OrderBy
+	Join            = domain.Join
+	Command         = domain.Command
+	CommandType     = domain.CommandType
+	CommandOptions  = domain.CommandOptions
+	CommandSpec     = domain.CommandSpec
+	FieldValue      = domain.FieldValue
+	Condition       = domain.Condition
+	ColumnRef       = domain.ColumnRef
+	Operator        = domain.Operator
+	JoinType        = domain.JoinType
+	SortDirection   = domain.SortDirection
+	ExecuteResult   = domain.ExecuteResult
+	Operation       = domain.Operation
+	OperationType   = domain.OperationType
+	OperationResult = domain.OperationResult
+)
+
+// Configuration, transactions and metadata
+type (
+	DatabaseType     = domain.DatabaseType
+	DataType         = domain.DataType
+	Config           = domain.Config
+	TxOptions        = domain.TxOptions
+	IsolationLevel   = domain.IsolationLevel
+	StorageInfo      = domain.StorageInfo
+	StorageLimits    = domain.StorageLimits
+	HealthStatus     = domain.HealthStatus
+	HealthStatusType = domain.HealthStatusType
+	ColumnType       = domain.ColumnType
+)
+
+// Schema
+type (
+	TableSchema          = domain.TableSchema
+	ColumnDefinition     = domain.ColumnDefinition
+	IndexDefinition      = domain.IndexDefinition
+	IndexType            = domain.IndexType
+	ConstraintDefinition = domain.ConstraintDefinition
+	ConstraintType       = domain.ConstraintType
+	ReferentialAction    = domain.ReferentialAction
+	SchemaChange         = domain.SchemaChange
+	SchemaChangeType     = domain.SchemaChangeType
 )
 
 // Constants
@@ -70,6 +127,7 @@ const (
 	DatabaseTypeCassandra   = domain.DatabaseTypeCassandra
 
 	// Data types
+	DataTypeUnknown  = domain.DataTypeUnknown
 	DataTypeString   = domain.DataTypeString
 	DataTypeInteger  = domain.DataTypeInteger
 	DataTypeFloat    = domain.DataTypeFloat
@@ -80,17 +138,20 @@ const (
 	DataTypeBinary   = domain.DataTypeBinary
 	DataTypeJSON     = domain.DataTypeJSON
 	DataTypeUUID     = domain.DataTypeUUID
-	DataTypeDecimal  = domain.DataTypeDecimal
 	DataTypeArray    = domain.DataTypeArray
 	DataTypeMap      = domain.DataTypeMap
+	DataTypeDecimal  = domain.DataTypeDecimal
 	DataTypeText     = domain.DataTypeText
-	DataTypeUnknown  = domain.DataTypeUnknown
 
 	// Query types
 	QueryTypeSelect = domain.QueryTypeSelect
 	QueryTypeInsert = domain.QueryTypeInsert
 	QueryTypeUpdate = domain.QueryTypeUpdate
 	QueryTypeDelete = domain.QueryTypeDelete
+	QueryTypeCreate = domain.QueryTypeCreate
+	QueryTypeDrop   = domain.QueryTypeDrop
+	QueryTypeAlter  = domain.QueryTypeAlter
+	QueryTypeCustom = domain.QueryTypeCustom
 
 	// Command types
 	CommandTypeInsert     = domain.CommandTypeInsert
@@ -104,24 +165,6 @@ const (
 	OperationTypeQuery   = domain.OperationTypeQuery
 	OperationTypeCommand = domain.OperationTypeCommand
 
-	// Sort directions
-	SortDirectionAsc  = domain.SortDirectionAsc
-	SortDirectionDesc = domain.SortDirectionDesc
-
-	// Isolation levels
-	IsolationLevelDefault         = domain.IsolationLevelDefault
-	IsolationLevelReadUncommitted = domain.IsolationLevelReadUncommitted
-	IsolationLevelReadCommitted   = domain.IsolationLevelReadCommitted
-	IsolationLevelRepeatableRead  = domain.IsolationLevelRepeatableRead
-	IsolationLevelSerializable    = domain.IsolationLevelSerializable
-
-	// Join types
-	JoinTypeInner = domain.JoinTypeInner
-	JoinTypeLeft  = domain.JoinTypeLeft
-	JoinTypeRight = domain.JoinTypeRight
-	JoinTypeFull  = domain.JoinTypeFull
-	JoinTypeCross = domain.JoinTypeCross
-
 	// Operators
 	OperatorEqual              = domain.OperatorEqual
 	OperatorNotEqual           = domain.OperatorNotEqual
@@ -133,29 +176,32 @@ const (
 	OperatorNotLike            = domain.OperatorNotLike
 	OperatorIn                 = domain.OperatorIn
 	OperatorNotIn              = domain.OperatorNotIn
-	OperatorIsNull             = domain.OperatorIsNull
-	OperatorIsNotNull          = domain.OperatorIsNotNull
 	OperatorBetween            = domain.OperatorBetween
 	OperatorNotBetween         = domain.OperatorNotBetween
+	OperatorIsNull             = domain.OperatorIsNull
+	OperatorIsNotNull          = domain.OperatorIsNotNull
+	OperatorExists             = domain.OperatorExists
+	OperatorNotExists          = domain.OperatorNotExists
+	OperatorAnd                = domain.OperatorAnd
+	OperatorOr                 = domain.OperatorOr
 
-	// Conflict resolution
-	ConflictResolutionIgnore  = domain.ConflictResolutionIgnore
-	ConflictResolutionReplace = domain.ConflictResolutionReplace
-	ConflictResolutionUpdate  = domain.ConflictResolutionUpdate
-	ConflictResolutionError   = domain.ConflictResolutionError
+	// Join types
+	JoinTypeInner = domain.JoinTypeInner
+	JoinTypeLeft  = domain.JoinTypeLeft
+	JoinTypeRight = domain.JoinTypeRight
+	JoinTypeFull  = domain.JoinTypeFull
+	JoinTypeCross = domain.JoinTypeCross
 
-	// Schema change types
-	SchemaChangeTypeAddColumn    = domain.SchemaChangeTypeAddColumn
-	SchemaChangeTypeDropColumn   = domain.SchemaChangeTypeDropColumn
-	SchemaChangeTypeModifyColumn = domain.SchemaChangeTypeModifyColumn
-	SchemaChangeTypeAddIndex     = domain.SchemaChangeTypeAddIndex
-	SchemaChangeTypeDropIndex    = domain.SchemaChangeTypeDropIndex
+	// Sort directions
+	SortDirectionAsc  = domain.SortDirectionAsc
+	SortDirectionDesc = domain.SortDirectionDesc
 
-	// Index types
-	IndexTypeBTree = domain.IndexTypeBTree
-	IndexTypeHash  = domain.IndexTypeHash
-	IndexTypeGIN   = domain.IndexTypeGIN
-	IndexTypeGiST  = domain.IndexTypeGiST
+	// Isolation levels
+	IsolationLevelDefault         = domain.IsolationLevelDefault
+	IsolationLevelReadUncommitted = domain.IsolationLevelReadUncommitted
+	IsolationLevelReadCommitted   = domain.IsolationLevelReadCommitted
+	IsolationLevelRepeatableRead  = domain.IsolationLevelRepeatableRead
+	IsolationLevelSerializable    = domain.IsolationLevelSerializable
 
 	// Health status types
 	HealthStatusHealthy   = domain.HealthStatusHealthy
@@ -163,16 +209,31 @@ const (
 	HealthStatusUnhealthy = domain.HealthStatusUnhealthy
 	HealthStatusUnknown   = domain.HealthStatusUnknown
 
-	// Error types
-	ErrorTypeConnection  = domain.ErrorTypeConnection
-	ErrorTypeQuery       = domain.ErrorTypeQuery
-	ErrorTypeTransaction = domain.ErrorTypeTransaction
-	ErrorTypeData        = domain.ErrorTypeData
-	ErrorTypeSchema      = domain.ErrorTypeSchema
-	ErrorTypeTimeout     = domain.ErrorTypeTimeout
-	ErrorTypeValidation  = domain.ErrorTypeValidation
-	ErrorTypeUnknown     = domain.ErrorTypeUnknown
-)
+	// Index types
+	IndexTypeBTree = domain.IndexTypeBTree
+	IndexTypeHash  = domain.IndexTypeHash
+	IndexTypeGIN   = domain.IndexTypeGIN
+	IndexTypeGiST  = domain.IndexTypeGiST
 
-// Error types and constructors are re-exported from domain package
-// These will be available once the domain error types are properly defined
+	// Constraint types
+	ConstraintTypePrimaryKey = domain.ConstraintTypePrimaryKey
+	ConstraintTypeForeignKey = domain.ConstraintTypeForeignKey
+	ConstraintTypeUnique     = domain.ConstraintTypeUnique
+	ConstraintTypeCheck      = domain.ConstraintTypeCheck
+
+	// Referential actions
+	ReferentialActionNoAction   = domain.ReferentialActionNoAction
+	ReferentialActionRestrict   = domain.ReferentialActionRestrict
+	ReferentialActionCascade    = domain.ReferentialActionCascade
+	ReferentialActionSetNull    = domain.ReferentialActionSetNull
+	ReferentialActionSetDefault = domain.ReferentialActionSetDefault
+
+	// Schema change types
+	SchemaChangeTypeAddColumn      = domain.SchemaChangeTypeAddColumn
+	SchemaChangeTypeDropColumn     = domain.SchemaChangeTypeDropColumn
+	SchemaChangeTypeModifyColumn   = domain.SchemaChangeTypeModifyColumn
+	SchemaChangeTypeAddIndex       = domain.SchemaChangeTypeAddIndex
+	SchemaChangeTypeDropIndex      = domain.SchemaChangeTypeDropIndex
+	SchemaChangeTypeAddConstraint  = domain.SchemaChangeTypeAddConstraint
+	SchemaChangeTypeDropConstraint = domain.SchemaChangeTypeDropConstraint
+)

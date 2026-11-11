@@ -1,7 +1,8 @@
-package domain
+package domain_test
 
 import (
 	"errors"
+	"fmt"
 	"testing"
 
 	"github.com/AnandSGit/HybridCache.io/internal/domain"
@@ -438,8 +439,6 @@ func TestErrorType_String(t *testing.T) {
 		{"Data", domain.ErrorTypeData, "data"},
 		{"Schema", domain.ErrorTypeSchema, "schema"},
 		{"Adapter", domain.ErrorTypeAdapter, "adapter"},
-		{"Migration", domain.ErrorTypeMigration, "migration"},
-		{"Cache", domain.ErrorTypeCache, "cache"},
 		{"Validation", domain.ErrorTypeValidation, "validation"},
 		{"Timeout", domain.ErrorTypeTimeout, "timeout"},
 		{"Permission", domain.ErrorTypePermission, "permission"},
@@ -453,4 +452,44 @@ func TestErrorType_String(t *testing.T) {
 			assert.Equal(t, tt.expected, result)
 		})
 	}
+}
+
+func TestStorageError_IsSentinel(t *testing.T) {
+	tests := []struct {
+		name     string
+		err      error
+		sentinel error
+	}{
+		{"no rows", domain.NewNoRowsError(), domain.ErrNoRows},
+		{"duplicate key", domain.NewDuplicateKeyError("users_email_key"), domain.ErrDuplicateKey},
+		{"constraint", domain.NewConstraintViolationError("chk_age"), domain.ErrConstraintViolation},
+		{"deadlock", domain.NewDeadlockError(), domain.ErrDeadlock},
+		{"query timeout", domain.NewQueryTimeoutError("SELECT 1"), domain.ErrQueryTimeout},
+		{"tx closed", domain.NewTransactionClosedError(), domain.ErrTransactionClosed},
+		{"unsupported op", domain.NewUnsupportedOperationError("savepoint"), domain.ErrUnsupportedOperation},
+		{"unsupported query", domain.NewUnsupportedQueryError("joins"), domain.ErrUnsupportedQuery},
+		{"table not found", domain.NewTableNotFoundError("users"), domain.ErrTableNotFound},
+		{"wrapped no rows", fmt.Errorf("repo: %w", domain.NewNoRowsError()), domain.ErrNoRows},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			assert.True(t, errors.Is(tt.err, tt.sentinel))
+			assert.False(t, errors.Is(tt.err, domain.ErrInternalError))
+		})
+	}
+}
+
+func TestClassificationHelpers_WrappedErrors(t *testing.T) {
+	wrap := func(err error) error { return fmt.Errorf("layer: %w", err) }
+
+	assert.True(t, domain.IsRetryable(wrap(domain.NewDeadlockError())))
+	assert.True(t, domain.IsTemporary(wrap(domain.NewConnectionPoolFullError())))
+	assert.True(t, domain.IsConnectionError(wrap(domain.NewConnectionError("X", "y"))))
+	assert.True(t, domain.IsQueryError(wrap(domain.NewQueryError("X", "y"))))
+	assert.True(t, domain.IsTransactionError(wrap(domain.NewTransactionClosedError())))
+	assert.True(t, domain.IsDataError(wrap(domain.NewNoRowsError())))
+	assert.True(t, domain.IsTimeoutError(wrap(domain.NewQueryTimeoutError("q"))))
+
+	assert.False(t, domain.IsRetryable(errors.New("plain")))
+	assert.False(t, domain.IsQueryError(nil))
 }

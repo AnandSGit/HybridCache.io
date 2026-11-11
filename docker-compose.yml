@@ -1,272 +1,78 @@
-version: '3.8'
+# Local databases for developing and testing the Go and Python libraries.
+#
+#   make dev-up      # docker compose up -d --wait  (returns once both are healthy)
+#   make dev-down    # docker compose down          (add -v to also delete the data)
+#
+# Connection strings matching these defaults (used by the integration tests
+# and examples):
+#
+#   POSTGRES_DSN=postgres://testuser:testpass@localhost:5432/testdb?sslmode=disable
+#   MONGODB_URI=mongodb://localhost:27017/?replicaSet=rs0&directConnection=true
+#
+# PostgreSQL credentials can be overridden with POSTGRES_USER, POSTGRES_PASSWORD
+# and POSTGRES_DB (in the environment or a .env file next to this file). They
+# only take effect when the data volume is first created; update POSTGRES_DSN
+# to match.
+#
+# MongoDB runs as a single-node replica set (rs0) because multi-document
+# transactions require one; the healthcheck initiates the replica set on first
+# start and reports healthy once this node is primary. MongoDB has no
+# authentication here, so both ports are published on 127.0.0.1 only.
+
+name: hybridcache
 
 services:
-  # PostgreSQL Database
   postgres:
-    image: postgres:14-alpine
-    container_name: storage_postgres
+    image: postgres:18-alpine
     environment:
-      POSTGRES_DB: testdb
-      POSTGRES_USER: testuser
-      POSTGRES_PASSWORD: testpass
-      POSTGRES_INITDB_ARGS: "--encoding=UTF-8"
+      POSTGRES_USER: ${POSTGRES_USER:-testuser}
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:-testpass}
+      POSTGRES_DB: ${POSTGRES_DB:-testdb}
     ports:
-      - "5432:5432"
+      - "127.0.0.1:5432:5432"
     volumes:
-      - postgres_data:/var/lib/postgresql/data
-      - ./scripts/postgres-init.sql:/docker-entrypoint-initdb.d/init.sql
+      # PostgreSQL 18+ images keep data in a major-version subdirectory of
+      # /var/lib/postgresql, so the volume is mounted there.
+      - postgres_data:/var/lib/postgresql
     healthcheck:
-      test: ["CMD-SHELL", "pg_isready -U testuser -d testdb"]
+      # Probe over TCP: during first-time initialization the entrypoint runs a
+      # temporary server that only listens on the Unix socket.
+      test: ["CMD-SHELL", "pg_isready -h 127.0.0.1 -p 5432 -U \"$${POSTGRES_USER}\" -d \"$${POSTGRES_DB}\""]
       interval: 10s
       timeout: 5s
       retries: 5
-    networks:
-      - storage_network
+      start_period: 30s
+      start_interval: 1s
 
-  # MySQL Database
-  mysql:
-    image: mysql:8.0
-    container_name: storage_mysql
-    environment:
-      MYSQL_DATABASE: testdb
-      MYSQL_USER: testuser
-      MYSQL_PASSWORD: testpass
-      MYSQL_ROOT_PASSWORD: rootpass
-      MYSQL_CHARSET: utf8mb4
-      MYSQL_COLLATION: utf8mb4_unicode_ci
-    ports:
-      - "3306:3306"
-    volumes:
-      - mysql_data:/var/lib/mysql
-      - ./scripts/mysql-init.sql:/docker-entrypoint-initdb.d/init.sql
-    healthcheck:
-      test: ["CMD", "mysqladmin", "ping", "-h", "localhost", "-u", "testuser", "-ptestpass"]
-      interval: 10s
-      timeout: 5s
-      retries: 5
-    networks:
-      - storage_network
-
-  # Redis Cache
-  redis:
-    image: redis:7-alpine
-    container_name: storage_redis
-    ports:
-      - "6379:6379"
-    volumes:
-      - redis_data:/data
-      - ./scripts/redis.conf:/usr/local/etc/redis/redis.conf
-    command: redis-server /usr/local/etc/redis/redis.conf
-    healthcheck:
-      test: ["CMD", "redis-cli", "ping"]
-      interval: 10s
-      timeout: 5s
-      retries: 5
-    networks:
-      - storage_network
-
-  # MongoDB Document Database
   mongodb:
-    image: mongo:5
-    container_name: storage_mongodb
-    environment:
-      MONGO_INITDB_DATABASE: testdb
-      MONGO_INITDB_ROOT_USERNAME: testuser
-      MONGO_INITDB_ROOT_PASSWORD: testpass
+    image: mongo:8.0
+    command: ["--replSet", "rs0", "--bind_ip_all"]
     ports:
-      - "27017:27017"
+      - "127.0.0.1:27017:27017"
     volumes:
       - mongodb_data:/data/db
-      - ./scripts/mongo-init.js:/docker-entrypoint-initdb.d/init.js
+      # Declared as a volume by the image; named so that it is reused rather
+      # than left behind as a new anonymous volume after each down/up.
+      - mongodb_config:/data/configdb
     healthcheck:
-      test: ["CMD", "mongo", "--eval", "db.adminCommand('ping')"]
+      # Idempotent: initiates rs0 only if it has no configuration yet, then
+      # fails until this node has been elected primary.
+      test:
+        - CMD
+        - mongosh
+        - --quiet
+        - --eval
+        - >-
+          try { rs.status(); } catch (e) {
+          rs.initiate({ _id: 'rs0', members: [{ _id: 0, host: 'localhost:27017' }] }); }
+          if (!db.hello().isWritablePrimary) { quit(1); }
       interval: 10s
-      timeout: 5s
+      timeout: 10s
       retries: 5
-    networks:
-      - storage_network
-
-  # SQLite (for file-based testing)
-  sqlite:
-    image: alpine:latest
-    container_name: storage_sqlite
-    volumes:
-      - sqlite_data:/data
-      - ./scripts/sqlite-init.sql:/init.sql
-    command: sh -c "apk add --no-cache sqlite && sqlite3 /data/test.db < /init.sql && tail -f /dev/null"
-    networks:
-      - storage_network
-
-  # Test Runner Service
-  test-runner:
-    build:
-      context: .
-      dockerfile: Dockerfile.test
-    container_name: storage_test_runner
-    depends_on:
-      postgres:
-        condition: service_healthy
-      mysql:
-        condition: service_healthy
-      redis:
-        condition: service_healthy
-      mongodb:
-        condition: service_healthy
-    environment:
-      - POSTGRES_DSN=postgres://testuser:testpass@postgres:5432/testdb?sslmode=disable
-      - MYSQL_DSN=testuser:testpass@tcp(mysql:3306)/testdb?parseTime=true
-      - REDIS_DSN=redis://redis:6379/0
-      - MONGODB_DSN=mongodb://testuser:testpass@mongodb:27017/testdb
-      - SQLITE_DSN=/data/test.db
-    volumes:
-      - .:/app
-      - sqlite_data:/data
-    working_dir: /app
-    networks:
-      - storage_network
-    profiles:
-      - test
-
-  # Development Environment
-  dev:
-    build:
-      context: .
-      dockerfile: Dockerfile.dev
-    container_name: storage_dev
-    depends_on:
-      postgres:
-        condition: service_healthy
-      redis:
-        condition: service_healthy
-    environment:
-      - POSTGRES_DSN=postgres://testuser:testpass@postgres:5432/testdb?sslmode=disable
-      - REDIS_DSN=redis://redis:6379/0
-    volumes:
-      - .:/app
-      - go_cache:/go/pkg/mod
-    working_dir: /app
-    ports:
-      - "8080:8080"
-    networks:
-      - storage_network
-    profiles:
-      - dev
-
-  # Monitoring and Observability
-  prometheus:
-    image: prom/prometheus:latest
-    container_name: storage_prometheus
-    ports:
-      - "9090:9090"
-    volumes:
-      - ./monitoring/prometheus.yml:/etc/prometheus/prometheus.yml
-      - prometheus_data:/prometheus
-    command:
-      - '--config.file=/etc/prometheus/prometheus.yml'
-      - '--storage.tsdb.path=/prometheus'
-      - '--web.console.libraries=/etc/prometheus/console_libraries'
-      - '--web.console.templates=/etc/prometheus/consoles'
-      - '--web.enable-lifecycle'
-    networks:
-      - storage_network
-    profiles:
-      - monitoring
-
-  grafana:
-    image: grafana/grafana:latest
-    container_name: storage_grafana
-    ports:
-      - "3000:3000"
-    environment:
-      - GF_SECURITY_ADMIN_PASSWORD=admin
-    volumes:
-      - grafana_data:/var/lib/grafana
-      - ./monitoring/grafana/dashboards:/etc/grafana/provisioning/dashboards
-      - ./monitoring/grafana/datasources:/etc/grafana/provisioning/datasources
-    networks:
-      - storage_network
-    profiles:
-      - monitoring
-
-  # Database Administration Tools
-  pgadmin:
-    image: dpage/pgadmin4:latest
-    container_name: storage_pgadmin
-    environment:
-      PGADMIN_DEFAULT_EMAIL: admin@example.com
-      PGADMIN_DEFAULT_PASSWORD: admin
-    ports:
-      - "5050:80"
-    volumes:
-      - pgadmin_data:/var/lib/pgadmin
-    networks:
-      - storage_network
-    profiles:
-      - admin
-
-  phpmyadmin:
-    image: phpmyadmin/phpmyadmin:latest
-    container_name: storage_phpmyadmin
-    environment:
-      PMA_HOST: mysql
-      PMA_USER: testuser
-      PMA_PASSWORD: testpass
-    ports:
-      - "8081:80"
-    networks:
-      - storage_network
-    profiles:
-      - admin
-
-  redis-commander:
-    image: rediscommander/redis-commander:latest
-    container_name: storage_redis_commander
-    environment:
-      REDIS_HOSTS: local:redis:6379
-    ports:
-      - "8082:8081"
-    networks:
-      - storage_network
-    profiles:
-      - admin
-
-  mongo-express:
-    image: mongo-express:latest
-    container_name: storage_mongo_express
-    environment:
-      ME_CONFIG_MONGODB_ADMINUSERNAME: testuser
-      ME_CONFIG_MONGODB_ADMINPASSWORD: testpass
-      ME_CONFIG_MONGODB_URL: mongodb://testuser:testpass@mongodb:27017/
-    ports:
-      - "8083:8081"
-    networks:
-      - storage_network
-    profiles:
-      - admin
+      start_period: 30s
+      start_interval: 1s
 
 volumes:
   postgres_data:
-    driver: local
-  mysql_data:
-    driver: local
-  redis_data:
-    driver: local
   mongodb_data:
-    driver: local
-  sqlite_data:
-    driver: local
-  prometheus_data:
-    driver: local
-  grafana_data:
-    driver: local
-  pgadmin_data:
-    driver: local
-  go_cache:
-    driver: local
-
-networks:
-  storage_network:
-    driver: bridge
-    ipam:
-      config:
-        - subnet: 172.20.0.0/16
+  mongodb_config:

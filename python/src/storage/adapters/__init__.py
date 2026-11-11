@@ -1,8 +1,7 @@
 """
 Database adapters for the Database Agnostic Storage Library.
 
-This package contains implementations of the storage interfaces for
-different database systems.
+Each subpackage implements the ``storage.interfaces`` contract for one database.
 """
 
-__all__ = []
+__all__: list[str] = []

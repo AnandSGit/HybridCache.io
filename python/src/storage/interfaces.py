@@ -1,24 +1,28 @@
 """
 Core interfaces for the Database Agnostic Storage Library.
 
-This module defines the abstract interfaces that all database adapters must implement,
-providing a unified API across different database types while maintaining async support.
+Abstract base classes that every database adapter implements, mirroring
+``internal/domain/interfaces.go`` of the Go implementation.
 """
 
 from __future__ import annotations
 
 from abc import ABC, abstractmethod
-from typing import Any, AsyncContextManager, AsyncIterator, Dict, List, Optional, Type
+from collections.abc import AsyncIterator
+from types import TracebackType
+from typing import Any, Self, final
 
 from storage.types import (
     Command,
     Config,
+    DatabaseType,
     DataType,
     ExecuteResult,
     HealthStatus,
     Operation,
     OperationResult,
     Query,
+    SchemaChange,
     StorageInfo,
     TableSchema,
     TxOptions,
@@ -26,591 +30,391 @@ from storage.types import (
 
 
 class Row(ABC):
-    """Interface for a single database row result."""
-    
+    """A single result row."""
+
     @abstractmethod
     async def scan(self, *destinations: Any) -> None:
-        """Scan the row into the provided destinations.
-        
-        Args:
-            *destinations: Variables to scan the row values into
-            
+        """Scan the row's values, in column order, into ``destinations``.
+
         Raises:
-            DataError: If scanning fails
+            DataError: If scanning fails.
         """
-        ...
-    
+
     @abstractmethod
     async def scan_into(self, obj: Any) -> None:
-        """Scan the row into a dataclass or object.
-        
-        Args:
-            obj: Object to scan the row into
-            
+        """Set the attributes of ``obj`` (e.g. a dataclass) from matching columns.
+
         Raises:
-            DataError: If scanning fails
+            DataError: If scanning fails.
         """
-        ...
-    
+
     @abstractmethod
     def get(self, key: str, default: Any = None) -> Any:
-        """Get a value by column name.
-        
-        Args:
-            key: Column name
-            default: Default value if key not found
-            
-        Returns:
-            The column value or default
-        """
-        ...
-    
+        """Return the value of column ``key``, or ``default`` if there is none."""
+
     @abstractmethod
-    def keys(self) -> List[str]:
-        """Get all column names.
-        
-        Returns:
-            List of column names
-        """
-        ...
-    
+    def keys(self) -> list[str]:
+        """Return the column names."""
+
     @abstractmethod
-    def values(self) -> List[Any]:
-        """Get all column values.
-        
-        Returns:
-            List of column values
-        """
-        ...
-    
+    def values(self) -> list[Any]:
+        """Return the column values."""
+
     @abstractmethod
-    def items(self) -> List[tuple[str, Any]]:
-        """Get all column name-value pairs.
-        
-        Returns:
-            List of (name, value) tuples
-        """
-        ...
+    def items(self) -> list[tuple[str, Any]]:
+        """Return the (column name, value) pairs."""
 
 
 class Result(ABC):
-    """Interface for database query results."""
-    
+    """Query results, consumed as an async iterator of rows or with ``fetch*``."""
+
     @abstractmethod
     def __aiter__(self) -> AsyncIterator[Row]:
-        """Async iterator over result rows."""
-        ...
-    
+        """Return the async iterator over the remaining rows."""
+
     @abstractmethod
     async def __anext__(self) -> Row:
-        """Get the next row."""
-        ...
-    
+        """Return the next row; raise ``StopAsyncIteration`` when exhausted."""
+
     @abstractmethod
-    async def fetchone(self) -> Optional[Row]:
-        """Fetch a single row.
-        
-        Returns:
-            The next row or None if no more rows
-        """
-        ...
-    
+    async def fetchone(self) -> Row | None:
+        """Return the next row, or ``None`` when exhausted."""
+
     @abstractmethod
-    async def fetchmany(self, size: int = 1000) -> List[Row]:
-        """Fetch multiple rows.
-        
-        Args:
-            size: Maximum number of rows to fetch
-            
-        Returns:
-            List of rows
-        """
-        ...
-    
+    async def fetchmany(self, size: int = 1000) -> list[Row]:
+        """Return up to ``size`` of the remaining rows."""
+
     @abstractmethod
-    async def fetchall(self) -> List[Row]:
-        """Fetch all remaining rows.
-        
-        Returns:
-            List of all rows
-        """
-        ...
-    
+    async def fetchall(self) -> list[Row]:
+        """Return all remaining rows."""
+
     @abstractmethod
     async def close(self) -> None:
-        """Close the result set and free resources."""
-        ...
-    
+        """Close the result set and free its resources."""
+
     @abstractmethod
-    def columns(self) -> List[str]:
-        """Get column names.
-        
-        Returns:
-            List of column names
-        """
-        ...
+    def columns(self) -> list[str]:
+        """Return the column names."""
 
 
 class Transaction(ABC):
-    """Interface for database transactions."""
-    
+    """A database transaction, begun by ``Storage.begin_tx``.
+
+    ``begin_tx`` begins the transaction exactly once; entering ``async with`` does
+    not begin it again. Leaving the block commits when the block completes
+    normally and rolls back when it raises, unless the transaction was already
+    committed or rolled back inside the block::
+
+        async with await storage.begin_tx() as tx:
+            await tx.execute(command)
+
+    When set, ``TxOptions.timeout`` (else ``Config.tx_timeout``) bounds the
+    transaction from ``begin_tx`` until it ends.
+    """
+
+    @final
+    async def __aenter__(self) -> Self:
+        return self
+
+    @final
+    async def __aexit__(
+        self,
+        exc_type: type[BaseException] | None,
+        exc: BaseException | None,
+        traceback: TracebackType | None,
+    ) -> None:
+        if not self.is_active():
+            return
+        if exc_type is not None:
+            await self.rollback()
+            return
+        try:
+            await self.commit()
+        except BaseException:
+            # Do not leave a transaction open when its commit failed.
+            if self.is_active():
+                await self.rollback()
+            raise
+
     @abstractmethod
     async def query(self, query: Query) -> Result:
         """Execute a query within the transaction.
-        
-        Args:
-            query: The query to execute
-            
-        Returns:
-            Query results
-            
+
         Raises:
-            QueryError: If query execution fails
-            TransactionError: If transaction is not active
+            TransactionClosedError: If the transaction is not active.
+            QueryError: If the query fails.
         """
-        ...
-    
+
     @abstractmethod
-    async def query_one(self, query: Query) -> Optional[Row]:
-        """Execute a query and return a single row.
-        
-        Args:
-            query: The query to execute
-            
-        Returns:
-            Single row or None
-            
+    async def query_one(self, query: Query) -> Row | None:
+        """Execute a query and return its first row, or ``None`` if it has none.
+
         Raises:
-            QueryError: If query execution fails
-            TransactionError: If transaction is not active
+            TransactionClosedError: If the transaction is not active.
+            QueryError: If the query fails.
         """
-        ...
-    
+
     @abstractmethod
     async def execute(self, command: Command) -> ExecuteResult:
         """Execute a command within the transaction.
-        
-        Args:
-            command: The command to execute
-            
-        Returns:
-            Execution result
-            
+
         Raises:
-            QueryError: If command execution fails
-            TransactionError: If transaction is not active
+            TransactionClosedError: If the transaction is not active.
+            QueryError: If the command fails.
         """
-        ...
-    
+
     @abstractmethod
-    async def batch(self, operations: List[Operation]) -> List[OperationResult]:
-        """Execute multiple operations within the transaction.
-        
-        Args:
-            operations: List of operations to execute
-            
-        Returns:
-            List of operation results
-            
+    async def batch(self, operations: list[Operation]) -> list[OperationResult]:
+        """Execute operations in order within the transaction.
+
         Raises:
-            QueryError: If any operation fails
-            TransactionError: If transaction is not active
+            TransactionClosedError: If the transaction is not active.
         """
-        ...
-    
+
     @abstractmethod
     async def commit(self) -> None:
         """Commit the transaction.
-        
+
         Raises:
-            TransactionError: If commit fails
+            TransactionClosedError: If the transaction is not active.
+            TransactionError: If the commit fails.
         """
-        ...
-    
+
     @abstractmethod
     async def rollback(self) -> None:
-        """Rollback the transaction.
-        
+        """Roll back the transaction; a no-op when it is no longer active.
+
         Raises:
-            TransactionError: If rollback fails
+            TransactionError: If the rollback fails.
         """
-        ...
-    
+
     @abstractmethod
     async def savepoint(self, name: str) -> None:
         """Create a savepoint.
-        
-        Args:
-            name: Savepoint name
-            
+
         Raises:
-            TransactionError: If savepoint creation fails
+            TransactionClosedError: If the transaction is not active.
+            UnsupportedOperationError: If the database has no savepoints (MongoDB).
         """
-        ...
-    
+
     @abstractmethod
     async def rollback_to_savepoint(self, name: str) -> None:
-        """Rollback to a savepoint.
-        
-        Args:
-            name: Savepoint name
-            
+        """Roll back to a savepoint.
+
         Raises:
-            TransactionError: If rollback fails
+            TransactionClosedError: If the transaction is not active.
+            UnsupportedOperationError: If the database has no savepoints (MongoDB).
         """
-        ...
-    
+
     @abstractmethod
     def is_active(self) -> bool:
-        """Check if the transaction is active.
-        
-        Returns:
-            True if transaction is active
-        """
-        ...
-    
+        """Return whether the transaction is still open."""
+
     @abstractmethod
     def get_id(self) -> str:
-        """Get the transaction ID.
-        
-        Returns:
-            Transaction ID
-        """
-        ...
+        """Return the transaction ID."""
 
 
 class Storage(ABC):
-    """Main interface for database storage operations."""
-    
+    """Main interface for database storage operations.
+
+    ``Adapter.connect`` returns an already-connected storage. A ``Query`` or
+    ``Command`` without a timeout is bounded by ``Config.query_timeout``.
+    """
+
     @abstractmethod
     async def connect(self) -> None:
-        """Establish connection to the database.
-        
+        """Re-verify connectivity.
+
         Raises:
-            ConnectionError: If connection fails
+            StorageConnectionError: If the database cannot be reached.
         """
-        ...
-    
+
     @abstractmethod
     async def close(self) -> None:
-        """Close the database connection and cleanup resources."""
-        ...
-    
+        """Close the connections and free resources."""
+
     @abstractmethod
     async def ping(self) -> None:
-        """Test the database connection.
-        
+        """Check the connection.
+
         Raises:
-            ConnectionError: If ping fails
+            StorageConnectionError: If the database cannot be reached.
         """
-        ...
-    
+
+    @abstractmethod
+    async def health(self) -> HealthStatus:
+        """Return the health status."""
+
     @abstractmethod
     async def query(self, query: Query) -> Result:
         """Execute a query.
-        
-        Args:
-            query: The query to execute
-            
-        Returns:
-            Query results
-            
+
         Raises:
-            QueryError: If query execution fails
+            QueryError: If the query fails; ``UnsupportedQueryError`` if the adapter
+                cannot execute it.
         """
-        ...
-    
+
     @abstractmethod
-    async def query_one(self, query: Query) -> Optional[Row]:
-        """Execute a query and return a single row.
-        
-        Args:
-            query: The query to execute
-            
-        Returns:
-            Single row or None
-            
+    async def query_one(self, query: Query) -> Row | None:
+        """Execute a query and return its first row, or ``None`` if it has none.
+
         Raises:
-            QueryError: If query execution fails
+            QueryError: If the query fails.
         """
-        ...
-    
+
     @abstractmethod
     async def execute(self, command: Command) -> ExecuteResult:
         """Execute a command.
-        
-        Args:
-            command: The command to execute
-            
-        Returns:
-            Execution result
-            
+
         Raises:
-            QueryError: If command execution fails
+            QueryError: If the command fails; ``UnsupportedQueryError`` if the
+                adapter cannot execute it.
         """
-        ...
-    
+
     @abstractmethod
-    async def begin_tx(self, options: Optional[TxOptions] = None) -> Transaction:
-        """Begin a new transaction.
-        
-        Args:
-            options: Transaction options
-            
-        Returns:
-            New transaction
-            
+    async def begin_tx(self, options: TxOptions | None = None) -> Transaction:
+        """Begin a transaction and return it, already active.
+
         Raises:
-            TransactionError: If transaction creation fails
+            TransactionError: If the transaction cannot be begun.
         """
-        ...
-    
+
     @abstractmethod
-    async def batch(self, operations: List[Operation]) -> List[OperationResult]:
-        """Execute multiple operations in a batch.
-        
-        Args:
-            operations: List of operations to execute
-            
-        Returns:
-            List of operation results
-            
-        Raises:
-            QueryError: If any operation fails
-        """
-        ...
-    
+    async def batch(self, operations: list[Operation]) -> list[OperationResult]:
+        """Execute operations in order; each result carries its error, if any."""
+
     @abstractmethod
     async def create_table(self, schema: TableSchema) -> None:
-        """Create a table.
-        
-        Args:
-            schema: Table schema definition
-            
+        """Create a table (a collection, for document databases).
+
         Raises:
-            SchemaError: If table creation fails
+            SchemaError: If the table cannot be created.
         """
-        ...
-    
+
     @abstractmethod
     async def drop_table(self, table_name: str) -> None:
         """Drop a table.
-        
-        Args:
-            table_name: Name of the table to drop
-            
+
         Raises:
-            SchemaError: If table drop fails
+            SchemaError: If the table cannot be dropped.
         """
-        ...
-    
+
     @abstractmethod
-    async def list_tables(self) -> List[str]:
-        """List all tables.
-        
-        Returns:
-            List of table names
-            
+    async def alter_table(self, table_name: str, changes: list[SchemaChange]) -> None:
+        """Apply schema changes to a table.
+
         Raises:
-            SchemaError: If listing fails
+            SchemaError: If a change fails.
+            UnsupportedOperationError: If the adapter does not support a change.
         """
-        ...
-    
-    @abstractmethod
-    async def describe_table(self, table_name: str) -> TableSchema:
-        """Get table schema.
-        
-        Args:
-            table_name: Name of the table
-            
-        Returns:
-            Table schema
-            
-        Raises:
-            SchemaError: If table doesn't exist or describe fails
-        """
-        ...
-    
+
     @abstractmethod
     def info(self) -> StorageInfo:
-        """Get storage information.
-        
-        Returns:
-            Storage information
-        """
-        ...
-    
+        """Return information about the storage."""
+
     @abstractmethod
-    async def health(self) -> HealthStatus:
-        """Get health status.
-        
-        Returns:
-            Health status
+    async def list_tables(self) -> list[str]:
+        """Return the table names.
+
+        Raises:
+            SchemaError: If listing fails.
         """
-        ...
+
+    @abstractmethod
+    async def describe_table(self, table_name: str) -> TableSchema:
+        """Return the schema of a table.
+
+        Raises:
+            TableNotFoundError: If the table does not exist.
+            SchemaError: If describing fails.
+        """
 
 
 class Adapter(ABC):
-    """Interface for database adapters."""
-    
+    """Factory and metadata for one database type."""
+
     @abstractmethod
     def name(self) -> str:
-        """Get adapter name.
-        
-        Returns:
-            Adapter name
-        """
-        ...
-    
+        """Return the adapter name."""
+
     @abstractmethod
     def version(self) -> str:
-        """Get adapter version.
-        
-        Returns:
-            Adapter version
-        """
-        ...
-    
+        """Return the adapter version."""
+
     @abstractmethod
-    def database_type(self) -> str:
-        """Get database type.
-        
-        Returns:
-            Database type
-        """
-        ...
-    
+    def database_type(self) -> DatabaseType:
+        """Return the database type the adapter connects to."""
+
     @abstractmethod
     async def connect(self, config: Config) -> Storage:
-        """Create a storage connection.
-        
-        Args:
-            config: Connection configuration
-            
-        Returns:
-            Storage instance
-            
+        """Validate ``config`` and return a connected storage.
+
         Raises:
-            ConnectionError: If connection fails
+            ValidationError: If the configuration is invalid.
+            StorageConnectionError: If the connection fails.
         """
-        ...
-    
+
     @abstractmethod
     def parse_dsn(self, dsn: str) -> Config:
-        """Parse a DSN into configuration.
-        
-        Args:
-            dsn: Data source name
-            
-        Returns:
-            Parsed configuration
-            
+        """Parse a data source name into a configuration.
+
         Raises:
-            ValidationError: If DSN is invalid
+            InvalidDSNError: If the DSN is invalid.
         """
-        ...
-    
+
     @abstractmethod
     def validate_config(self, config: Config) -> None:
-        """Validate configuration.
-        
-        Args:
-            config: Configuration to validate
-            
+        """Validate a configuration.
+
         Raises:
-            ValidationError: If configuration is invalid
+            InvalidConfigError: If the configuration is invalid.
         """
-        ...
-    
+
     @abstractmethod
-    def translate_query(self, query: Query) -> tuple[str, List[Any]]:
-        """Translate a query to database-specific SQL.
-        
-        Args:
-            query: Query to translate
-            
-        Returns:
-            Tuple of (SQL, parameters)
-            
+    def translate_query(self, query: Query) -> tuple[str, list[Any]]:
+        """Return the native form of ``query`` and its parameters.
+
         Raises:
-            QueryError: If translation fails
+            QueryError: If the query cannot be translated.
         """
-        ...
-    
+
     @abstractmethod
-    def translate_command(self, command: Command) -> tuple[str, List[Any]]:
-        """Translate a command to database-specific SQL.
-        
-        Args:
-            command: Command to translate
-            
-        Returns:
-            Tuple of (SQL, parameters)
-            
+    def translate_command(self, command: Command) -> tuple[str, list[Any]]:
+        """Return the native form of ``command`` and its parameters.
+
         Raises:
-            QueryError: If translation fails
+            QueryError: If the command cannot be translated.
         """
-        ...
-    
+
     @abstractmethod
-    def map_go_type(self, value: Any) -> DataType:
-        """Map a Python type to a storage data type.
-        
-        Args:
-            value: Python value
-            
-        Returns:
-            Storage data type
-            
+    def map_python_type(self, value: Any) -> DataType:
+        """Return the data type that stores a Python value such as ``value``.
+
         Raises:
-            ValidationError: If type cannot be mapped
+            ValidationError: If the type cannot be mapped.
         """
-        ...
-    
+
     @abstractmethod
     def map_database_type(self, db_type: str) -> DataType:
-        """Map a database type to a storage data type.
-        
-        Args:
-            db_type: Database type name
-            
-        Returns:
-            Storage data type
-            
+        """Return the data type for a database type name.
+
         Raises:
-            ValidationError: If type cannot be mapped
+            ValidationError: If the type cannot be mapped.
         """
-        ...
-    
+
     @abstractmethod
     def supports_transactions(self) -> bool:
-        """Check if adapter supports transactions."""
-        ...
-    
+        """Return whether the adapter supports transactions."""
+
     @abstractmethod
     def supports_joins(self) -> bool:
-        """Check if adapter supports joins."""
-        ...
-    
+        """Return whether the adapter supports joins."""
+
     @abstractmethod
     def supports_batch(self) -> bool:
-        """Check if adapter supports batch operations."""
-        ...
-    
+        """Return whether the adapter supports batch operations."""
+
     @abstractmethod
     def supports_schema(self) -> bool:
-        """Check if adapter supports schema operations."""
-        ...
-
-
-class HealthChecker(ABC):
-    """Interface for health checking."""
-    
-    @abstractmethod
-    async def check_health(self) -> HealthStatus:
-        """Check system health.
-        
-        Returns:
-            Health status
-        """
-        ...
+        """Return whether the adapter supports schema operations."""

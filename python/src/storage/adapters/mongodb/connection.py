@@ -1,31 +1,46 @@
 """
-MongoDB connection and storage implementation.
+MongoDB storage on PyMongo's native asyncio API (``pymongo.AsyncMongoClient``).
 
-This module provides the main storage implementation for MongoDB using Motor
-for high-performance async database operations.
+Queries and commands must be built with the query builder: their ``spec`` is
+translated into MongoDB operations (see ``translate``), and raw SQL is rejected.
 """
 
 from __future__ import annotations
 
-import asyncio
+import contextlib
 import datetime
-import logging
-from typing import Any, Dict, List, Optional
+from dataclasses import dataclass
+from typing import Any
+from urllib.parse import quote_plus, urlencode
 
-from motor.motor_asyncio import AsyncIOMotorClient, AsyncIOMotorDatabase
-from pymongo.errors import PyMongoError
+from pymongo import ASCENDING, HASHED, AsyncMongoClient, IndexModel, uri_parser
+from pymongo.asynchronous.database import AsyncDatabase
+from pymongo.errors import CollectionInvalid, InvalidName, PyMongoError
 
+from storage.adapters.mongodb.executor import Executor
 from storage.adapters.mongodb.result import MongoDBResult, MongoDBRow
+from storage.adapters.mongodb.support import (
+    bounded,
+    deadline_after,
+    has_error_code,
+    positive_seconds,
+)
 from storage.adapters.mongodb.transaction import MongoDBTransaction
+from storage.adapters.mongodb.translate import check_field
 from storage.errors import (
-    ConnectionError,
-    QueryError,
+    ConnectionClosedError,
+    ConnectionFailedError,
+    ConnectionTimeoutError,
+    IndexNotFoundError,
+    InvalidConfigError,
+    InvalidDSNError,
+    InvalidSchemaError,
     SchemaError,
-    new_connection_error,
-    new_connection_timeout_error,
-    new_query_error,
-    new_schema_error,
-    wrap_error,
+    SchemaExistsError,
+    StorageError,
+    ValidationError,
+    new_table_not_found_error,
+    new_unsupported_operation_error,
 )
 from storage.interfaces import Storage
 from storage.types import (
@@ -35,463 +50,445 @@ from storage.types import (
     ExecuteResult,
     HealthStatus,
     HealthStatusType,
+    IndexDefinition,
+    IndexType,
     Operation,
     OperationResult,
-    OperationType,
     Query,
+    SchemaChange,
+    SchemaChangeType,
     StorageInfo,
     StorageLimits,
     TableSchema,
     TxOptions,
 )
 
-logger = logging.getLogger(__name__)
+ADAPTER_NAME = "mongodb"
+ADAPTER_VERSION = "1.0.0"
+DEFAULT_PORT = 27017
+
+# MongoDB server error codes.
+_INDEX_NOT_FOUND = 27
+_NAMESPACE_EXISTS = 48
+
+_INDEX_KEYS: dict[IndexType, int | str] = {
+    IndexType.BTREE: ASCENDING,
+    IndexType.HASH: HASHED,
+}
+
+
+@dataclass(frozen=True)
+class ClientSettings:
+    """How to create the client for a configuration."""
+
+    uri: str
+    database: str
+    options: dict[str, Any]  # AsyncMongoClient keyword arguments
+
+
+def parse_uri(
+    uri: str, error: type[ValidationError] = InvalidDSNError
+) -> dict[str, Any]:
+    """Parse and validate a MongoDB URI with ``pymongo.uri_parser.parse_uri``.
+
+    A ``mongodb+srv://`` URI is resolved through DNS, as PyMongo does.
+
+    Raises:
+        ValidationError: ``error``, if the URI is invalid.
+    """
+    try:
+        return uri_parser.parse_uri(uri)
+    except (PyMongoError, ValueError) as exc:
+        if "@" in uri:
+            # PyMongo's message may quote the URI's credentials.
+            raise error("invalid MongoDB URI") from None
+        raise error("invalid MongoDB URI") from exc
+
+
+def build_uri(config: Config) -> str:
+    """Build a connection URI from the components of ``config``.
+
+    Credentials and options are percent-encoded. The database is not put in the
+    path, where it would also select the authentication database: it is selected
+    on the client instead.
+    """
+    host = config.host
+    if ":" in host and not host.startswith("["):
+        host = f"[{host}]"  # IPv6 literal
+    port = config.port if config.port is not None else DEFAULT_PORT
+    userinfo = ""
+    if config.username:
+        userinfo = quote_plus(config.username)
+        if config.password:
+            userinfo += ":" + quote_plus(config.password)
+        userinfo += "@"
+    uri = f"mongodb://{userinfo}{host}:{port}/"
+    pairs = [
+        (key, _option_text(item))
+        for key, value in sorted(config.options.items())
+        for item in (value if isinstance(value, list) else [value])
+    ]
+    return f"{uri}?{urlencode(pairs)}" if pairs else uri
+
+
+def _option_text(value: Any) -> str:
+    if isinstance(value, bool):
+        return "true" if value else "false"
+    return str(value)
+
+
+def client_settings(config: Config) -> ClientSettings:
+    """Validate ``config`` and return how to create its client.
+
+    The URI is ``config.dsn``, else built from the components. Options that the
+    URI sets take precedence over the pool and connect-timeout fields of
+    ``config``; the pool sizes count as one setting, so that they stay
+    consistent.
+
+    Raises:
+        InvalidDSNError: If ``config.dsn`` is invalid.
+        InvalidConfigError: If the configuration is otherwise invalid.
+    """
+    if not config.dsn and not config.host:
+        raise InvalidConfigError("host is required")
+    if config.dsn:
+        uri, parsed = config.dsn, parse_uri(config.dsn)
+    else:
+        uri = build_uri(config)
+        parsed = parse_uri(uri, InvalidConfigError)
+    database = config.database or parsed["database"] or ""
+    if not database:
+        raise InvalidConfigError("database is required")
+    if config.max_open_conns < 0:
+        raise InvalidConfigError("max_open_conns cannot be negative")
+    if config.max_idle_conns < 0:
+        raise InvalidConfigError("max_idle_conns cannot be negative")
+    if 0 < config.max_open_conns < config.max_idle_conns:
+        raise InvalidConfigError("max_idle_conns cannot exceed max_open_conns")
+
+    explicit = {name.lower() for name in parsed["options"]}
+    options: dict[str, Any] = {}
+    if not explicit & {"maxpoolsize", "minpoolsize"}:
+        # Zero keeps the driver's default.
+        if config.max_open_conns:
+            options["maxPoolSize"] = config.max_open_conns
+        if config.max_idle_conns:
+            options["minPoolSize"] = config.max_idle_conns
+    idle = positive_seconds(config.conn_max_idle_time)
+    if idle is not None and "maxidletimems" not in explicit:
+        options["maxIdleTimeMS"] = round(idle * 1000)
+    connect = positive_seconds(config.connect_timeout)
+    if connect is not None and "connecttimeoutms" not in explicit:
+        options["connectTimeoutMS"] = round(connect * 1000)
+    return ClientSettings(uri, database, options)
 
 
 class MongoDBStorage(Storage):
-    """MongoDB storage implementation using Motor."""
-    
+    """MongoDB storage. ``MongoDBAdapter.connect`` returns a connected one."""
+
     def __init__(self, config: Config) -> None:
-        """Initialize MongoDB storage.
-        
-        Args:
-            config: Database configuration
-        """
         self._config = config
-        self._client: Optional[AsyncIOMotorClient] = None
-        self._database: Optional[AsyncIOMotorDatabase] = None
-        self._closed = False
-    
+        self._client: AsyncMongoClient[dict[str, Any]] | None = None
+        self._executor: Executor | None = None
+
     async def connect(self) -> None:
-        """Connect to MongoDB.
-        
+        """Connect, or re-verify the connection; possible again after ``close``.
+
         Raises:
-            ConnectionError: If connection fails
+            ValidationError: If the configuration is invalid.
+            ConnectionTimeoutError: If the server cannot be reached within
+                ``Config.connect_timeout``.
+            ConnectionFailedError: If the connection fails otherwise.
         """
-        try:
-            # Build connection URI
-            uri = self._build_connection_uri()
-            
-            # Create client with connection options
-            self._client = AsyncIOMotorClient(
-                uri,
-                maxPoolSize=self._config.max_open_conns,
-                minPoolSize=self._config.max_idle_conns,
-                maxIdleTimeMS=int(self._config.conn_max_idle_time.total_seconds() * 1000) if self._config.conn_max_idle_time else 30000,
-                connectTimeoutMS=int(self._config.connect_timeout.total_seconds() * 1000) if self._config.connect_timeout else 10000,
-                socketTimeoutMS=int(self._config.query_timeout.total_seconds() * 1000) if self._config.query_timeout else 30000,
-                serverSelectionTimeoutMS=10000,
-            )
-            
-            # Get database
-            self._database = self._client[self._config.database]
-            
-            # Test connection
-            await self._client.admin.command("ping")
-            
-            logger.info(f"Connected to MongoDB database: {self._config.database}")
-            
-        except Exception as e:
-            await self._cleanup()
-            if isinstance(e, asyncio.TimeoutError):
-                raise new_connection_timeout_error("MongoDB connection timeout") from e
-            else:
-                raise new_connection_error(f"Failed to connect to MongoDB: {e}") from e
-    
-    async def close(self) -> None:
-        """Close the MongoDB connection."""
-        if not self._closed:
-            await self._cleanup()
-            logger.info("MongoDB connection closed")
-    
-    async def _cleanup(self) -> None:
-        """Clean up resources."""
-        self._closed = True
-        if self._client:
-            self._client.close()
-            self._client = None
-            self._database = None
-    
-    async def ping(self) -> None:
-        """Test the MongoDB connection.
-        
-        Raises:
-            ConnectionError: If ping fails
-        """
-        if self._closed or not self._client:
-            raise new_connection_error("MongoDB connection is closed")
-        
-        try:
-            await self._client.admin.command("ping")
-        except Exception as e:
-            raise new_connection_error(f"MongoDB ping failed: {e}") from e
-    
-    async def health(self) -> HealthStatus:
-        """Get the health status of MongoDB.
-        
-        Returns:
-            Health status information
-        """
-        try:
-            # Test connection
+        if self._client is not None:
             await self.ping()
-            
-            # Get server status
-            server_status = await self._database.command("serverStatus")
-            
-            return HealthStatus(
-                status=HealthStatusType.HEALTHY,
-                message="MongoDB is healthy",
-                timestamp=datetime.datetime.now(),
-                details={
-                    "host": server_status.get("host", "unknown"),
-                    "version": server_status.get("version", "unknown"),
-                    "uptime_seconds": server_status.get("uptime", 0),
-                    "connections": server_status.get("connections", {}),
-                }
+            return
+        settings = client_settings(self._config)
+        try:
+            client: AsyncMongoClient[dict[str, Any]] = AsyncMongoClient(
+                settings.uri, **settings.options
             )
-            
-        except Exception as e:
+        except (PyMongoError, ValueError, TypeError) as exc:
+            raise InvalidConfigError("invalid MongoDB client options") from exc
+        try:
+            database = client[settings.database]
+        except InvalidName as exc:
+            await client.close()
+            message = f"invalid database name {settings.database!r}"
+            raise InvalidConfigError(message) from exc
+        try:
+            await self._ping(client)
+        except BaseException:
+            await client.close()
+            raise
+        self._client = client
+        self._executor = Executor(database, self._config.query_timeout)
+
+    async def close(self) -> None:
+        """Close the client; idempotent."""
+        client, self._client, self._executor = self._client, None, None
+        if client is not None:
+            await client.close()
+
+    async def _ping(self, client: AsyncMongoClient[dict[str, Any]]) -> None:
+        try:
+            with bounded(deadline_after(self._config.connect_timeout)):
+                await client.admin.command("ping")
+        except PyMongoError as exc:
+            if exc.timeout:
+                raise ConnectionTimeoutError("timed out connecting to MongoDB") from exc
+            raise ConnectionFailedError("failed to ping MongoDB") from exc
+
+    def _connected(self) -> tuple[AsyncMongoClient[dict[str, Any]], Executor]:
+        if self._client is None or self._executor is None:
+            raise ConnectionClosedError("the MongoDB storage is not connected")
+        return self._client, self._executor
+
+    def _database(self) -> AsyncDatabase[dict[str, Any]]:
+        return self._connected()[1].database
+
+    async def ping(self) -> None:
+        """Ping the server, within ``Config.connect_timeout``."""
+        await self._ping(self._connected()[0])
+
+    async def health(self) -> HealthStatus:
+        """Ping the server and report its version (both need no privileges)."""
+        try:
+            await self.ping()
+        except StorageError as exc:
             return HealthStatus(
-                status=HealthStatusType.UNHEALTHY,
-                message=f"MongoDB health check failed: {e}",
-                timestamp=datetime.datetime.now(),
-                details={"error": str(e)}
+                HealthStatusType.UNHEALTHY, f"MongoDB ping failed: {exc}"
             )
-    
+        try:
+            with bounded(deadline_after(self._config.connect_timeout)):
+                build = await self._database().command("buildInfo")
+        except PyMongoError as exc:
+            message = f"MongoDB is reachable but buildInfo failed: {exc}"
+            return HealthStatus(HealthStatusType.DEGRADED, message)
+        return HealthStatus(
+            HealthStatusType.HEALTHY,
+            "MongoDB is healthy",
+            details={"version": build.get("version", "")},
+        )
+
     async def query(self, query: Query) -> MongoDBResult:
-        """Execute a query and return results.
-        
-        Args:
-            query: Query to execute
-            
-        Returns:
-            Query results
-            
-        Raises:
-            QueryError: If query execution fails
-        """
-        if self._closed or not self._database:
-            raise new_connection_error("MongoDB connection is closed")
-        
-        try:
-            # Extract collection name and build filter
-            collection_name = self._extract_collection_name(query.sql)
-            if not collection_name:
-                raise new_query_error("Collection name not found in query")
-            
-            collection = self._database[collection_name]
-            filter_doc = self._build_filter(query.parameters)
-            
-            # Execute find operation
-            cursor = collection.find(filter_doc)
-            
-            return MongoDBResult(cursor)
-            
-        except Exception as e:
-            if isinstance(e, QueryError):
-                raise
-            raise new_query_error(f"MongoDB query failed: {e}") from e
-    
-    async def query_one(self, query: Query) -> MongoDBRow:
-        """Execute a query and return a single row.
-        
-        Args:
-            query: Query to execute
-            
-        Returns:
-            Single query result
-            
-        Raises:
-            QueryError: If query execution fails
-        """
-        if self._closed or not self._database:
-            raise new_connection_error("MongoDB connection is closed")
-        
-        try:
-            # Extract collection name and build filter
-            collection_name = self._extract_collection_name(query.sql)
-            if not collection_name:
-                raise new_query_error("Collection name not found in query")
-            
-            collection = self._database[collection_name]
-            filter_doc = self._build_filter(query.parameters)
-            
-            # Execute findOne operation
-            document = await collection.find_one(filter_doc)
-            if document is None:
-                raise new_query_error("No document found")
-            
-            return MongoDBRow(document)
-            
-        except Exception as e:
-            if isinstance(e, QueryError):
-                raise
-            raise new_query_error(f"MongoDB query_one failed: {e}") from e
-    
+        return await self._connected()[1].query(query)
+
+    async def query_one(self, query: Query) -> MongoDBRow | None:
+        return await self._connected()[1].query_one(query)
+
     async def execute(self, command: Command) -> ExecuteResult:
-        """Execute a command and return the result.
-        
-        Args:
-            command: Command to execute
-            
-        Returns:
-            Execution result
-            
+        return await self._connected()[1].execute(command)
+
+    async def begin_tx(self, options: TxOptions | None = None) -> MongoDBTransaction:
+        """Begin a multi-document transaction (needs a replica set or a sharded
+        cluster)."""
+        client, executor = self._connected()
+        return await MongoDBTransaction.create(
+            client, executor, options, self._config.tx_timeout
+        )
+
+    async def batch(self, operations: list[Operation]) -> list[OperationResult]:
+        """Execute the operations sequentially, in order; each result carries its
+        rows (read into memory), ``ExecuteResult`` or error."""
+        return await self._connected()[1].batch(operations)
+
+    async def create_table(self, schema: TableSchema) -> None:
+        """Create a collection and its indexes, in order and with their names.
+
+        Columns and constraints are not enforced: collections are schemaless.
+
         Raises:
-            QueryError: If command execution fails
+            SchemaExistsError: If the collection exists.
+            UnsupportedOperationError: For index types other than BTREE and HASH,
+                and for partial indexes.
         """
-        if self._closed or not self._database:
-            raise new_connection_error("MongoDB connection is closed")
-        
+        if not schema.name:
+            raise InvalidSchemaError("table name is required")
+        models = [index_model(definition) for definition in schema.indexes]
+        database = self._database()
+        context = {"table": schema.name}
         try:
-            # Route to appropriate execution method based on command type
-            if command.type.value == "insert":
-                return await self._execute_insert(command)
-            elif command.type.value == "update":
-                return await self._execute_update(command)
-            elif command.type.value == "delete":
-                return await self._execute_delete(command)
+            await database.create_collection(schema.name)
+        except PyMongoError as exc:
+            if isinstance(exc, CollectionInvalid) or has_error_code(
+                exc, _NAMESPACE_EXISTS
+            ):
+                message = f"collection {schema.name!r} already exists"
+                raise SchemaExistsError(message, context=context) from exc
+            message = f"failed to create collection {schema.name!r}"
+            raise SchemaError(
+                message, code="CREATE_COLLECTION_FAILED", context=context
+            ) from exc
+        if not models:
+            return
+        try:
+            await database[schema.name].create_indexes(models)
+        except PyMongoError as exc:
+            # Leave no half-created table behind.
+            with contextlib.suppress(PyMongoError):
+                await database.drop_collection(schema.name)
+            message = f"failed to create the indexes of {schema.name!r}"
+            raise SchemaError(
+                message, code="CREATE_INDEX_FAILED", context=context
+            ) from exc
+
+    async def drop_table(self, table_name: str) -> None:
+        """Drop a collection; dropping a missing collection is not an error."""
+        try:
+            await self._database().drop_collection(table_name)
+        except PyMongoError as exc:
+            raise SchemaError(
+                f"failed to drop collection {table_name!r}",
+                code="DROP_COLLECTION_FAILED",
+                context={"table": table_name},
+            ) from exc
+
+    async def alter_table(self, table_name: str, changes: list[SchemaChange]) -> None:
+        """Add or drop indexes, in order; every change is validated first.
+
+        Raises:
+            TableNotFoundError: If the collection does not exist.
+            IndexNotFoundError: If an index to drop does not exist.
+            UnsupportedOperationError: For column changes, which schemaless
+                collections do not have.
+        """
+        # An index to create, or the name of an index to drop.
+        steps: list[IndexModel | str] = []
+        for change in changes:
+            if change.change_type is SchemaChangeType.ADD_INDEX:
+                if change.index is None:
+                    raise InvalidSchemaError("ADD_INDEX needs an index definition")
+                steps.append(index_model(change.index))
+            elif change.change_type is SchemaChangeType.DROP_INDEX:
+                if change.index is None or not change.index.name:
+                    raise InvalidSchemaError("index name is required to drop an index")
+                steps.append(change.index.name)
             else:
-                raise new_query_error(f"Unsupported command type: {command.type}")
-                
-        except Exception as e:
-            if isinstance(e, QueryError):
-                raise
-            raise new_query_error(f"MongoDB command execution failed: {e}") from e
-    
-    async def begin_tx(self, options: Optional[TxOptions] = None) -> MongoDBTransaction:
-        """Begin a new transaction.
-        
-        Args:
-            options: Transaction options
-            
-        Returns:
-            Transaction instance
-            
-        Raises:
-            TransactionError: If transaction creation fails
-        """
-        if self._closed or not self._client:
-            raise new_connection_error("MongoDB connection is closed")
-        
-        return await MongoDBTransaction.create(self._client, self._database, options)
-    
-    async def batch(self, operations: List[Operation]) -> List[OperationResult]:
-        """Execute multiple operations in a batch.
-        
-        Args:
-            operations: List of operations to execute
-            
-        Returns:
-            List of operation results
-            
-        Raises:
-            QueryError: If batch execution fails
-        """
-        if self._closed or not self._database:
-            raise new_connection_error("MongoDB connection is closed")
-        
-        results = []
-        
-        # Group operations by collection for bulk operations
-        collection_ops: Dict[str, List[tuple[int, Operation]]] = {}
-        
-        for i, op in enumerate(operations):
-            collection_name = self._extract_collection_name(op.query.sql)
-            if not collection_name:
-                results.append(OperationResult(
-                    success=False,
-                    error=new_query_error("Collection name not found in operation")
-                ))
+                operation = f"schema change {change.change_type.value}"
+                raise new_unsupported_operation_error(operation)
+        await self._require_collection(table_name)
+
+        collection = self._database()[table_name]
+        for step in steps:
+            if isinstance(step, IndexModel):
+                try:
+                    await collection.create_indexes([step])
+                except PyMongoError as exc:
+                    raise SchemaError(
+                        f"failed to create an index on {table_name!r}",
+                        code="ADD_INDEX_FAILED",
+                        context={"table": table_name},
+                    ) from exc
                 continue
-            
-            if collection_name not in collection_ops:
-                collection_ops[collection_name] = []
-            collection_ops[collection_name].append((i, op))
-        
-        # Initialize results list
-        results = [OperationResult(success=False) for _ in operations]
-        
-        # Execute bulk operations for each collection
-        for collection_name, ops in collection_ops.items():
+            context = {"table": table_name, "index": step}
             try:
-                collection = self._database[collection_name]
-                bulk_ops = []
-                
-                for _, op in ops:
-                    if op.type == OperationType.INSERT:
-                        doc = self._build_document(op.query.parameters)
-                        bulk_ops.append({"insertOne": {"document": doc}})
-                    elif op.type == OperationType.UPDATE:
-                        mid = len(op.query.parameters) // 2
-                        filter_doc = self._build_filter(op.query.parameters[:mid])
-                        update_doc = {"$set": self._build_document(op.query.parameters[mid:])}
-                        bulk_ops.append({"updateOne": {"filter": filter_doc, "update": update_doc}})
-                    elif op.type == OperationType.DELETE:
-                        filter_doc = self._build_filter(op.query.parameters)
-                        bulk_ops.append({"deleteOne": {"filter": filter_doc}})
-                
-                if bulk_ops:
-                    await collection.bulk_write(bulk_ops)
-                    
-                    # Mark all operations for this collection as successful
-                    for idx, _ in ops:
-                        results[idx] = OperationResult(success=True)
-                        
-            except Exception as e:
-                # Mark all operations for this collection as failed
-                for idx, _ in ops:
-                    results[idx] = OperationResult(
-                        success=False,
-                        error=new_query_error(f"Bulk operation failed: {e}")
-                    )
-        
-        return results
-    
+                await collection.drop_index(step)
+            except PyMongoError as exc:
+                if has_error_code(exc, _INDEX_NOT_FOUND):
+                    message = f"index not found: {step}"
+                    raise IndexNotFoundError(message, context=context) from exc
+                raise SchemaError(
+                    f"failed to drop index {step!r}",
+                    code="DROP_INDEX_FAILED",
+                    context=context,
+                ) from exc
+
     def info(self) -> StorageInfo:
-        """Get storage information.
-        
-        Returns:
-            Storage information
-        """
+        """Return the adapter's identity, features and limits."""
         return StorageInfo(
-            name="mongodb",
-            version="1.0.0",
+            name=ADAPTER_NAME,
+            version=ADAPTER_VERSION,
             database_type=DatabaseType.MONGODB,
-            features=[
-                "transactions",
-                "aggregation",
-                "batch",
-                "schema",
-                "json",
-                "arrays",
-                "full-text-search",
-                "geospatial",
-                "gridfs",
-            ],
+            features=["transactions", "batch", "schema", "json", "arrays"],
             limits=StorageLimits(
                 max_connections=self._config.max_open_conns,
-                max_query_size=16 * 1024 * 1024,  # 16MB BSON document limit
-                max_transaction_age=datetime.timedelta(minutes=1),  # MongoDB transaction timeout
-                max_batch_size=100000,  # MongoDB bulk write limit
-            )
+                max_query_size=16 * 1024 * 1024,  # the BSON document size limit
+                # The default transactionLifetimeLimitSeconds.
+                max_transaction_age=datetime.timedelta(minutes=1),
+                max_batch_size=100_000,  # maxWriteBatchSize
+            ),
         )
-    
-    # Helper methods
-    
-    def _build_connection_uri(self) -> str:
-        """Build MongoDB connection URI from config."""
-        if self._config.dsn:
-            return self._config.dsn
-        
-        # Build URI from components
-        uri_parts = ["mongodb://"]
-        
-        # Add authentication
-        if self._config.username:
-            uri_parts.append(self._config.username)
-            if self._config.password:
-                uri_parts.append(f":{self._config.password}")
-            uri_parts.append("@")
-        
-        # Add host and port
-        uri_parts.append(self._config.host)
-        if self._config.port and self._config.port != 27017:
-            uri_parts.append(f":{self._config.port}")
-        
-        # Add database
-        if self._config.database:
-            uri_parts.append(f"/{self._config.database}")
-        
-        # Add options
-        if self._config.options:
-            query_params = []
-            for key, value in self._config.options.items():
-                query_params.append(f"{key}={value}")
-            if query_params:
-                uri_parts.append(f"?{'&'.join(query_params)}")
-        
-        return "".join(uri_parts)
-    
-    def _extract_collection_name(self, sql: str) -> str:
-        """Extract collection name from query SQL.
-        
-        This is a simplified implementation - in practice, you'd have a proper parser.
+
+    async def list_tables(self) -> list[str]:
+        """Return the collection names, sorted."""
+        try:
+            return sorted(await self._database().list_collection_names())
+        except PyMongoError as exc:
+            raise SchemaError(
+                "failed to list collections", code="LIST_COLLECTIONS_FAILED"
+            ) from exc
+
+    async def describe_table(self, table_name: str) -> TableSchema:
+        """Describe a collection's indexes, other than the ``_id`` index, with
+        their keys in order. Collections are schemaless: no columns are reported.
+
+        Raises:
+            TableNotFoundError: If the collection does not exist.
         """
-        if not sql:
-            return ""
-        
-        # For now, assume the collection name is passed in a specific format
-        # In a real implementation, you'd parse SQL-like syntax or use MongoDB-specific format
-        return "default_collection"
-    
-    def _build_filter(self, params: List[Any]) -> Dict[str, Any]:
-        """Build MongoDB filter document from parameters."""
-        filter_doc = {}
-        
-        # Simple parameter mapping - in practice, you'd have sophisticated query building
-        for i in range(0, len(params), 2):
-            if i + 1 < len(params):
-                key = params[i]
-                value = params[i + 1]
-                if isinstance(key, str):
-                    filter_doc[key] = value
-        
-        return filter_doc
-    
-    def _build_document(self, params: List[Any]) -> Dict[str, Any]:
-        """Build MongoDB document from parameters."""
-        return self._build_filter(params)
-    
-    async def _execute_insert(self, command: Command) -> ExecuteResult:
-        """Execute an insert command."""
-        collection_name = self._extract_collection_name(command.sql)
-        if not collection_name:
-            raise new_query_error("Collection name not found in command")
-        
-        collection = self._database[collection_name]
-        document = self._build_document(command.parameters)
-        
-        result = await collection.insert_one(document)
-        
-        return ExecuteResult(
-            rows_affected=1,
-            last_insert_id=str(result.inserted_id) if result.inserted_id else None
+        await self._require_collection(table_name)
+        try:
+            information = await self._database()[table_name].index_information()
+        except PyMongoError as exc:
+            raise SchemaError(
+                f"failed to list the indexes of {table_name!r}",
+                code="LIST_INDEXES_FAILED",
+                context={"table": table_name},
+            ) from exc
+        indexes = [
+            IndexDefinition(
+                name=name,
+                columns=[key for key, _ in spec["key"]],
+                unique=bool(spec.get("unique", False)),
+                index_type=(
+                    IndexType.HASH
+                    if any(kind == HASHED for _, kind in spec["key"])
+                    else IndexType.BTREE
+                ),
+            )
+            for name, spec in information.items()
+            if name != "_id_"
+        ]
+        return TableSchema(name=table_name, indexes=indexes)
+
+    async def _require_collection(self, name: str) -> None:
+        """Raise ``TableNotFoundError`` unless the collection exists (MongoDB would
+        otherwise create it implicitly, or report nothing)."""
+        try:
+            names = await self._database().list_collection_names(filter={"name": name})
+        except PyMongoError as exc:
+            raise SchemaError(
+                "failed to list collections", code="LIST_COLLECTIONS_FAILED"
+            ) from exc
+        if not names:
+            raise new_table_not_found_error(name)
+
+
+def index_model(definition: IndexDefinition) -> IndexModel:
+    """Translate an index definition; without a name, the server names it (e.g.
+    ``email_1``).
+
+    Raises:
+        InvalidSchemaError: If the index has no columns.
+        UnsupportedOperationError: For index types other than BTREE and HASH, and
+            for partial indexes (whose condition is SQL).
+    """
+    if not definition.columns:
+        raise InvalidSchemaError(
+            f"index {definition.name!r} must have at least one column",
+            context={"index": definition.name},
         )
-    
-    async def _execute_update(self, command: Command) -> ExecuteResult:
-        """Execute an update command."""
-        collection_name = self._extract_collection_name(command.sql)
-        if not collection_name:
-            raise new_query_error("Collection name not found in command")
-        
-        collection = self._database[collection_name]
-        
-        # Split parameters into filter and update parts
-        mid = len(command.parameters) // 2
-        filter_doc = self._build_filter(command.parameters[:mid])
-        update_doc = {"$set": self._build_document(command.parameters[mid:])}
-        
-        result = await collection.update_many(filter_doc, update_doc)
-        
-        return ExecuteResult(
-            rows_affected=result.modified_count,
-            last_insert_id=None
-        )
-    
-    async def _execute_delete(self, command: Command) -> ExecuteResult:
-        """Execute a delete command."""
-        collection_name = self._extract_collection_name(command.sql)
-        if not collection_name:
-            raise new_query_error("Collection name not found in command")
-        
-        collection = self._database[collection_name]
-        filter_doc = self._build_filter(command.parameters)
-        
-        result = await collection.delete_many(filter_doc)
-        
-        return ExecuteResult(
-            rows_affected=result.deleted_count,
-            last_insert_id=None
-        )
+    key = _INDEX_KEYS.get(definition.index_type)
+    if key is None:
+        operation = f"index type {definition.index_type.value}"
+        raise new_unsupported_operation_error(operation)
+    if definition.condition:
+        raise new_unsupported_operation_error("partial index conditions")
+    for column in definition.columns:
+        check_field(column)
+    options: dict[str, Any] = {}
+    if definition.name:
+        options["name"] = definition.name
+    if definition.unique:
+        options["unique"] = True
+    return IndexModel([(column, key) for column in definition.columns], **options)

@@ -1,294 +1,179 @@
 """
-MongoDB adapter implementation.
-
-This module provides the main adapter class for MongoDB database connections
-using Motor for high-performance async operations.
+MongoDB adapter: configuration, query translation and type mapping.
 """
 
 from __future__ import annotations
 
-import re
-from typing import Any, List
-from urllib.parse import parse_qs, urlparse
+import datetime
+from typing import Any
+from urllib.parse import parse_qsl
 
-from storage.adapters.mongodb.connection import MongoDBStorage
-from storage.errors import ValidationError, new_validation_error
-from storage.interfaces import Adapter, Storage
-from storage.types import (
-    Command,
-    Config,
-    DataType,
-    DatabaseType,
-    Query,
+from storage.adapters.mongodb.connection import (
+    ADAPTER_NAME,
+    ADAPTER_VERSION,
+    MongoDBStorage,
+    client_settings,
+    parse_uri,
+)
+from storage.adapters.mongodb.translate import (
+    plan_command,
+    plan_query,
+    render_command,
+    render_query,
+)
+from storage.errors import new_validation_error
+from storage.interfaces import Adapter
+from storage.types import Command, Config, DatabaseType, DataType, Query
+
+# MongoDB type names (the $type aliases, lowercased, plus a few common synonyms).
+_DATABASE_TYPES = {
+    "string": DataType.STRING,
+    "int": DataType.INTEGER,
+    "long": DataType.INTEGER,
+    "int32": DataType.INTEGER,
+    "int64": DataType.INTEGER,
+    "double": DataType.FLOAT,
+    "decimal": DataType.DECIMAL,
+    "bool": DataType.BOOLEAN,
+    "boolean": DataType.BOOLEAN,
+    "date": DataType.DATETIME,
+    "timestamp": DataType.DATETIME,
+    "bindata": DataType.BINARY,
+    "binary": DataType.BINARY,
+    "object": DataType.JSON,
+    "document": DataType.JSON,
+    "array": DataType.ARRAY,
+    "objectid": DataType.STRING,  # ObjectId as string
+}
+
+# Checked in order: bool is an int subclass.
+_PYTHON_TYPES: tuple[tuple[type | tuple[type, ...], DataType], ...] = (
+    (bool, DataType.BOOLEAN),
+    (int, DataType.INTEGER),
+    (float, DataType.FLOAT),
+    (str, DataType.STRING),
+    (datetime.datetime, DataType.DATETIME),
+    ((bytes, bytearray), DataType.BINARY),
+    ((dict, list), DataType.JSON),
 )
 
 
 class MongoDBAdapter(Adapter):
-    """MongoDB database adapter using Motor."""
-    
+    """Adapter for MongoDB 4.4+; transactions need a replica set or a sharded
+    cluster."""
+
     def name(self) -> str:
-        """Get adapter name."""
-        return "mongodb"
-    
+        return ADAPTER_NAME
+
     def version(self) -> str:
-        """Get adapter version."""
-        return "1.0.0"
-    
-    def database_type(self) -> str:
-        """Get database type."""
-        return DatabaseType.MONGODB.value
-    
-    async def connect(self, config: Config) -> Storage:
-        """Create a storage connection.
-        
-        Args:
-            config: Connection configuration
-            
-        Returns:
-            Storage instance
-            
+        return ADAPTER_VERSION
+
+    def database_type(self) -> DatabaseType:
+        return DatabaseType.MONGODB
+
+    async def connect(self, config: Config) -> MongoDBStorage:
+        """Validate ``config`` and return a connected storage.
+
+        The connection URI is ``config.dsn``, else built from the host, port
+        (default 27017), credentials and options; the database is
+        ``config.database``, else the one named in the DSN.
+
         Raises:
-            ConnectionError: If connection fails
+            ValidationError: If the configuration is invalid.
+            ConnectionTimeoutError: If the server cannot be reached within
+                ``Config.connect_timeout``.
+            ConnectionFailedError: If the connection fails otherwise.
         """
-        self.validate_config(config)
         storage = MongoDBStorage(config)
-        await storage.connect()
+        await storage.connect()  # validates config first
         return storage
-    
+
     def parse_dsn(self, dsn: str) -> Config:
-        """Parse a MongoDB connection string.
-        
-        Args:
-            dsn: MongoDB connection string
-            
-        Returns:
-            Parsed configuration
-            
+        """Parse a MongoDB URI; the DSN is kept for ``connect``.
+
+        ``host`` and ``port`` are those of the first host (for ``mongodb+srv://``,
+        the SRV name and no port), and ``options`` holds the URI's options as
+        written.
+
         Raises:
-            ValidationError: If DSN is invalid
+            InvalidDSNError: If the DSN is not a valid MongoDB URI.
         """
-        try:
-            parsed = urlparse(dsn)
-            
-            config = Config(
-                dsn=dsn,
-                host=parsed.hostname or "localhost",
-                port=parsed.port or 27017,
-                database=parsed.path.lstrip("/") if parsed.path else "",
-                username=parsed.username or "",
-                password=parsed.password or "",
-            )
-            
-            # Parse query parameters
-            if parsed.query:
-                params = parse_qs(parsed.query)
-                options = {}
-                
-                # Common MongoDB connection options
-                for key, values in params.items():
-                    if values:
-                        value = values[0]
-                        if key in ["authSource", "replicaSet", "ssl", "tls"]:
-                            options[key] = value
-                        elif key in ["maxPoolSize", "minPoolSize", "maxIdleTimeMS", "connectTimeoutMS", "socketTimeoutMS"]:
-                            try:
-                                options[key] = int(value)
-                            except ValueError:
-                                pass
-                
-                if options:
-                    config.options = options
-            
-            return config
-            
-        except Exception as e:
-            raise new_validation_error(f"Invalid MongoDB DSN: {e}") from e
-    
+        parsed = parse_uri(dsn)
+        if parsed["fqdn"]:
+            host, port = parsed["fqdn"], None
+        else:
+            host, port = parsed["nodelist"][0]
+        query = dsn.partition("?")[2]
+        separator = ";" if ";" in query and "&" not in query else "&"
+        options: dict[str, Any] = {}
+        for key, value in parse_qsl(query, keep_blank_values=True, separator=separator):
+            options.setdefault(key, value)
+        return Config(
+            host=host,
+            port=port,
+            database=parsed["database"] or "",
+            username=parsed["username"] or "",
+            password=parsed["password"] or "",
+            dsn=dsn,
+            options=options,
+        )
+
     def validate_config(self, config: Config) -> None:
-        """Validate the configuration.
-        
-        Args:
-            config: Configuration to validate
-            
+        """Validate a configuration, including its URI.
+
         Raises:
-            ValidationError: If configuration is invalid
+            InvalidDSNError: If ``config.dsn`` is invalid.
+            InvalidConfigError: If the configuration is otherwise invalid.
         """
-        if not config.dsn:
-            if not config.host:
-                raise new_validation_error("host is required")
-            if not config.database:
-                raise new_validation_error("database is required")
-        
-        if config.max_open_conns <= 0:
-            raise new_validation_error("max_open_conns must be positive")
-        
-        if config.max_idle_conns < 0:
-            raise new_validation_error("max_idle_conns cannot be negative")
-        
-        if config.max_idle_conns > config.max_open_conns:
-            raise new_validation_error("max_idle_conns cannot exceed max_open_conns")
-    
-    def translate_query(self, query: Query) -> tuple[str, List[Any]]:
-        """Translate a query to MongoDB-specific operations.
-        
-        Args:
-            query: Query to translate
-            
-        Returns:
-            Tuple of (operation, parameters)
-            
+        client_settings(config)
+
+    def translate_query(self, query: Query) -> tuple[str, list[Any]]:
+        """Render the MongoDB operation a builder-produced query runs as (for
+        logging and debugging); values are inlined, so no parameters are
+        returned.
+
         Raises:
-            QueryError: If translation fails
+            UnsupportedQueryError: For raw SQL and SQL-only features.
+            InvalidQueryError: If the query is malformed.
         """
-        # MongoDB doesn't use SQL, so we return the query as-is for now
-        # In a full implementation, this would translate SQL-like queries to MongoDB operations
-        return query.sql, query.parameters
-    
-    def translate_command(self, command: Command) -> tuple[str, List[Any]]:
-        """Translate a command to MongoDB-specific operations.
-        
-        Args:
-            command: Command to translate
-            
-        Returns:
-            Tuple of (operation, parameters)
-            
+        return render_query(plan_query(query)), []
+
+    def translate_command(self, command: Command) -> tuple[str, list[Any]]:
+        """Render the MongoDB operation a builder-produced command runs as (see
+        ``translate_query``)."""
+        return render_command(plan_command(command)), []
+
+    def map_python_type(self, value: Any) -> DataType:
+        """Return the data type that stores a Python value such as ``value``.
+
         Raises:
-            QueryError: If translation fails
+            ValidationError: If the value's type is not supported.
         """
-        # MongoDB doesn't use SQL, so we return the command as-is for now
-        # In a full implementation, this would translate SQL-like commands to MongoDB operations
-        return command.sql, command.parameters
-    
-    def map_go_type(self, go_type: str) -> DataType:
-        """Map Go types to MongoDB data types.
-        
-        Args:
-            go_type: Go type name
-            
-        Returns:
-            Corresponding data type
-            
-        Raises:
-            ValidationError: If type mapping fails
-        """
-        type_mapping = {
-            "string": DataType.STRING,
-            "int": DataType.INTEGER,
-            "int8": DataType.INTEGER,
-            "int16": DataType.INTEGER,
-            "int32": DataType.INTEGER,
-            "int64": DataType.INTEGER,
-            "uint": DataType.INTEGER,
-            "uint8": DataType.INTEGER,
-            "uint16": DataType.INTEGER,
-            "uint32": DataType.INTEGER,
-            "uint64": DataType.INTEGER,
-            "float32": DataType.FLOAT,
-            "float64": DataType.FLOAT,
-            "bool": DataType.BOOLEAN,
-            "time.Time": DataType.DATETIME,
-            "[]byte": DataType.BINARY,
-            "map[string]interface{}": DataType.JSON,
-            "[]interface{}": DataType.ARRAY,
-        }
-        
-        if go_type in type_mapping:
-            return type_mapping[go_type]
-        
-        raise new_validation_error(f"Unsupported Go type: {go_type}")
-    
+        for python_type, data_type in _PYTHON_TYPES:
+            if isinstance(value, python_type):
+                return data_type
+        raise new_validation_error(f"unsupported Python type: {type(value).__name__}")
+
     def map_database_type(self, db_type: str) -> DataType:
-        """Map MongoDB BSON types to domain data types.
-        
-        Args:
-            db_type: MongoDB BSON type name
-            
-        Returns:
-            Corresponding data type
-            
+        """Return the data type of a MongoDB type name (case-insensitive).
+
         Raises:
-            ValidationError: If type mapping fails
+            ValidationError: If the type name is not supported.
         """
-        type_mapping = {
-            "string": DataType.STRING,
-            "int": DataType.INTEGER,
-            "long": DataType.INTEGER,
-            "int32": DataType.INTEGER,
-            "int64": DataType.INTEGER,
-            "double": DataType.FLOAT,
-            "decimal": DataType.DECIMAL,
-            "bool": DataType.BOOLEAN,
-            "boolean": DataType.BOOLEAN,
-            "date": DataType.DATETIME,
-            "timestamp": DataType.DATETIME,
-            "bindata": DataType.BINARY,
-            "binary": DataType.BINARY,
-            "object": DataType.JSON,
-            "document": DataType.JSON,
-            "array": DataType.ARRAY,
-            "objectid": DataType.STRING,  # ObjectID as string
-        }
-        
-        normalized_type = db_type.lower()
-        if normalized_type in type_mapping:
-            return type_mapping[normalized_type]
-        
-        raise new_validation_error(f"Unsupported MongoDB type: {db_type}")
-    
+        data_type = _DATABASE_TYPES.get(db_type.lower())
+        if data_type is None:
+            raise new_validation_error(f"unsupported MongoDB type: {db_type}")
+        return data_type
+
     def supports_transactions(self) -> bool:
-        """Check if MongoDB supports transactions."""
-        return True  # MongoDB 4.0+ supports multi-document transactions
-    
-    def supports_joins(self) -> bool:
-        """Check if MongoDB supports joins."""
-        return True  # MongoDB supports $lookup aggregation for joins
-    
-    def supports_batch(self) -> bool:
-        """Check if MongoDB supports batch operations."""
         return True
-    
+
+    def supports_joins(self) -> bool:
+        """False: queries with joins raise ``UnsupportedQueryError``."""
+        return False
+
+    def supports_batch(self) -> bool:
+        return True
+
     def supports_schema(self) -> bool:
-        """Check if MongoDB supports schema operations."""
-        return True  # MongoDB supports collections and indexes
-    
-    def _build_connection_uri(self, config: Config) -> str:
-        """Build MongoDB connection URI from config.
-        
-        Args:
-            config: Database configuration
-            
-        Returns:
-            MongoDB connection URI
-        """
-        if config.dsn:
-            return config.dsn
-        
-        # Build URI from components
-        uri_parts = ["mongodb://"]
-        
-        # Add authentication
-        if config.username:
-            uri_parts.append(config.username)
-            if config.password:
-                uri_parts.append(f":{config.password}")
-            uri_parts.append("@")
-        
-        # Add host and port
-        uri_parts.append(config.host)
-        if config.port and config.port != 27017:
-            uri_parts.append(f":{config.port}")
-        
-        # Add database
-        if config.database:
-            uri_parts.append(f"/{config.database}")
-        
-        # Add options
-        if config.options:
-            query_params = []
-            for key, value in config.options.items():
-                query_params.append(f"{key}={value}")
-            if query_params:
-                uri_parts.append(f"?{'&'.join(query_params)}")
-        
-        return "".join(uri_parts)
+        return True

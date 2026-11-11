@@ -1,331 +1,318 @@
-// Performance example for Database Agnostic Storage Library
+// Command performance measures query, batch and transaction throughput on
+// PostgreSQL.
+//
+// It connects to POSTGRES_DSN (default: the database of docker-compose.yml),
+// works on its own perf_users table, and drops it when it finishes:
+//
+//	go run ./examples/performance
 package main
 
 import (
 	"context"
 	"fmt"
 	"log"
+	"os"
+	"slices"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	"github.com/AnandSGit/HybridCache.io/pkg/storage"
 )
 
-func main() {
-	ctx := context.Background()
+const (
+	defaultDSN = "postgres://testuser:testpass@localhost:5432/testdb?sslmode=disable"
+	table      = "perf_users"
+	seedRows   = 1000
+	iterations = 1000 // queries per query benchmark; the batch and transaction benchmarks run a tenth
+)
 
-	// Initialize PostgreSQL adapter with optimized settings
-	adapter := storage.NewPostgreSQLAdapter()
-	config := storage.Config{
-		Host:            "localhost",
-		Port:            5432,
-		Database:        "testdb",
-		Username:        "testuser",
-		Password:        "testpass",
-		MaxOpenConns:    50, // Higher for performance testing
-		MaxIdleConns:    25, // Higher for performance testing
-		ConnMaxLifetime: 1 * time.Hour,
-		ConnMaxIdleTime: 30 * time.Minute,
-		SSLMode:         "disable",
+func main() {
+	if err := run(context.Background(), iterations); err != nil {
+		log.Fatal(err)
 	}
+}
+
+func run(ctx context.Context, n int) error {
+	dsn := os.Getenv("POSTGRES_DSN")
+	if dsn == "" {
+		dsn = defaultDSN
+	}
+
+	adapter := storage.NewPostgreSQLAdapter()
+	config, err := adapter.ParseDSN(dsn)
+	if err != nil {
+		return fmt.Errorf("parse POSTGRES_DSN: %w", err)
+	}
+	config.MaxOpenConns = 20 // enough for the concurrent benchmarks
+	config.QueryTimeout = 30 * time.Second
 
 	store, err := adapter.Connect(ctx, config)
 	if err != nil {
-		log.Fatalf("Failed to connect: %v", err)
+		return fmt.Errorf("connect: %w", err)
 	}
 	defer store.Close()
 
-	fmt.Println("=== Database Agnostic Storage Library - Performance Testing ===")
-
-	// 1. Single Query Performance
-	fmt.Println("\n1. Single Query Performance:")
-	singleQueryPerformance(ctx, store)
-
-	// 2. Concurrent Query Performance
-	fmt.Println("\n2. Concurrent Query Performance:")
-	concurrentQueryPerformance(ctx, store)
-
-	// 3. Batch Operation Performance
-	fmt.Println("\n3. Batch Operation Performance:")
-	batchOperationPerformance(ctx, store)
-
-	// 4. Transaction Performance
-	fmt.Println("\n4. Transaction Performance:")
-	transactionPerformance(ctx, store)
-
-	// 5. Connection Pool Performance
-	fmt.Println("\n5. Connection Pool Performance:")
-	connectionPoolPerformance(ctx, store)
-}
-
-// singleQueryPerformance measures single query execution time
-func singleQueryPerformance(ctx context.Context, store storage.Storage) {
-	iterations := 1000
-
-	query := storage.NewBuilder().
-		Select("id", "name", "email").
-		From("users").
-		Where(storage.Equal("active", true)).
-		Limit(10)
-
-	queryObj, err := query.Build()
-	if err != nil {
-		log.Printf("Failed to build query: %v", err)
-		return
+	if err := setup(ctx, store); err != nil {
+		return err
 	}
+	defer drop(store)
 
-	start := time.Now()
-
-	for i := 0; i < iterations; i++ {
-		result, err := store.Query(ctx, queryObj)
-		if err != nil {
-			log.Printf("Query failed: %v", err)
-			continue
-		}
-
-		// Consume results
-		for result.Next() {
-			var id int
-			var name, email string
-			result.Scan(&id, &name, &email)
-		}
-		result.Close()
-	}
-
-	duration := time.Since(start)
-	avgLatency := duration / time.Duration(iterations)
-	qps := float64(iterations) / duration.Seconds()
-
-	fmt.Printf("  Executed %d queries in %v\n", iterations, duration)
-	fmt.Printf("  Average latency: %v\n", avgLatency)
-	fmt.Printf("  Queries per second: %.2f\n", qps)
-}
-
-// concurrentQueryPerformance measures concurrent query performance
-func concurrentQueryPerformance(ctx context.Context, store storage.Storage) {
-	workers := 10
-	queriesPerWorker := 100
-	totalQueries := workers * queriesPerWorker
-
-	query := storage.NewBuilder().
-		Select("COUNT(*)").
-		From("users").
-		Where(storage.Equal("active", true))
-
-	queryObj, err := query.Build()
-	if err != nil {
-		log.Printf("Failed to build query: %v", err)
-		return
-	}
-
-	var wg sync.WaitGroup
-	start := time.Now()
-
-	for w := 0; w < workers; w++ {
-		wg.Add(1)
-		go func() {
-			defer wg.Done()
-
-			for i := 0; i < queriesPerWorker; i++ {
-				result, err := store.Query(ctx, queryObj)
-				if err != nil {
-					log.Printf("Query failed: %v", err)
-					continue
-				}
-
-				if result.Next() {
-					var count int
-					result.Scan(&count)
-				}
-				result.Close()
-			}
-		}()
-	}
-
-	wg.Wait()
-	duration := time.Since(start)
-	qps := float64(totalQueries) / duration.Seconds()
-
-	fmt.Printf("  Executed %d concurrent queries with %d workers in %v\n",
-		totalQueries, workers, duration)
-	fmt.Printf("  Queries per second: %.2f\n", qps)
-}
-
-// batchOperationPerformance measures batch operation performance
-func batchOperationPerformance(ctx context.Context, store storage.Storage) {
-	batchSize := 100
-
-	// Create batch operations
-	operations := make([]storage.Operation, batchSize)
-	for i := 0; i < batchSize; i++ {
-		cmd := storage.Insert("users").
-			Set("name", fmt.Sprintf("Batch User %d", i)).
-			Set("email", fmt.Sprintf("batch%d@example.com", i)).
-			Set("age", 25+i%40).
-			Set("active", true)
-
-		command, err := cmd.Build()
-		if err != nil {
-			log.Printf("Failed to build command: %v", err)
-			continue
-		}
-
-		operations[i] = storage.Operation{
-			Type:    storage.OperationTypeCommand,
-			Command: command,
-		}
-	}
-
-	start := time.Now()
-	results, err := store.Batch(ctx, operations)
-	duration := time.Since(start)
-
-	if err != nil {
-		log.Printf("Batch operation failed: %v", err)
-		return
-	}
-
-	successCount := 0
-	for _, result := range results {
-		if result.Error == nil {
-			successCount++
-		}
-	}
-
-	opsPerSecond := float64(batchSize) / duration.Seconds()
-
-	fmt.Printf("  Executed batch of %d operations in %v\n", batchSize, duration)
-	fmt.Printf("  Successful operations: %d/%d\n", successCount, batchSize)
-	fmt.Printf("  Operations per second: %.2f\n", opsPerSecond)
-}
-
-// transactionPerformance measures transaction performance
-func transactionPerformance(ctx context.Context, store storage.Storage) {
-	iterations := 100
-
-	start := time.Now()
-
-	for i := 0; i < iterations; i++ {
-		tx, err := store.BeginTx(ctx, &storage.TxOptions{
-			Isolation: storage.IsolationLevelReadCommitted,
-		})
-		if err != nil {
-			log.Printf("Failed to begin transaction: %v", err)
-			continue
-		}
-
-		// Insert operation within transaction
-		cmd := storage.Insert("users").
-			Set("name", fmt.Sprintf("TX User %d", i)).
-			Set("email", fmt.Sprintf("tx%d@example.com", i)).
-			Set("age", 30).
-			Set("active", true)
-
-		command, err := cmd.Build()
-		if err != nil {
-			tx.Rollback()
-			continue
-		}
-
-		_, err = tx.Execute(ctx, command)
-		if err != nil {
-			tx.Rollback()
-			continue
-		}
-
-		// Commit transaction
-		if err := tx.Commit(); err != nil {
-			log.Printf("Failed to commit transaction: %v", err)
-		}
-	}
-
-	duration := time.Since(start)
-	txPerSecond := float64(iterations) / duration.Seconds()
-
-	fmt.Printf("  Executed %d transactions in %v\n", iterations, duration)
-	fmt.Printf("  Transactions per second: %.2f\n", txPerSecond)
-}
-
-// connectionPoolPerformance measures connection pool efficiency
-func connectionPoolPerformance(ctx context.Context, store storage.Storage) {
-	workers := 20
-	queriesPerWorker := 50
-
-	query := storage.NewBuilder().
-		Select("id").
-		From("users").
-		Limit(1)
-
-	queryObj, err := query.Build()
-	if err != nil {
-		log.Printf("Failed to build query: %v", err)
-		return
-	}
-
-	var wg sync.WaitGroup
-	connectionAcquisitionTimes := make([]time.Duration, workers*queriesPerWorker)
-	var mutex sync.Mutex
-	index := 0
-
-	start := time.Now()
-
-	for w := 0; w < workers; w++ {
-		wg.Add(1)
-		go func() {
-			defer wg.Done()
-
-			for i := 0; i < queriesPerWorker; i++ {
-				queryStart := time.Now()
-				result, err := store.Query(ctx, queryObj)
-				queryDuration := time.Since(queryStart)
-
-				mutex.Lock()
-				connectionAcquisitionTimes[index] = queryDuration
-				index++
-				mutex.Unlock()
-
-				if err != nil {
-					log.Printf("Query failed: %v", err)
-					continue
-				}
-
-				if result.Next() {
-					var id int
-					result.Scan(&id)
-				}
-				result.Close()
-			}
-		}()
-	}
-
-	wg.Wait()
-	totalDuration := time.Since(start)
-
-	// Calculate statistics
-	var totalAcquisitionTime time.Duration
-	var maxAcquisitionTime time.Duration
-	var minAcquisitionTime time.Duration = time.Hour // Initialize to a large value
-
-	for _, duration := range connectionAcquisitionTimes {
-		totalAcquisitionTime += duration
-		if duration > maxAcquisitionTime {
-			maxAcquisitionTime = duration
-		}
-		if duration < minAcquisitionTime {
-			minAcquisitionTime = duration
-		}
-	}
-
-	avgAcquisitionTime := totalAcquisitionTime / time.Duration(len(connectionAcquisitionTimes))
-
-	fmt.Printf("  Executed %d queries with %d workers in %v\n",
-		workers*queriesPerWorker, workers, totalDuration)
-	fmt.Printf("  Average query time: %v\n", avgAcquisitionTime)
-	fmt.Printf("  Min query time: %v\n", minAcquisitionTime)
-	fmt.Printf("  Max query time: %v\n", maxAcquisitionTime)
-
-	// Display storage info
 	info := store.Info()
-	fmt.Printf("  Storage: %s %s\n", info.Name, info.Version)
-	fmt.Printf("  Max connections: %d\n", info.Limits.MaxConnections)
+	fmt.Printf("%s, pool of %d connections, %d rows in %s\n", info.DatabaseType, info.Limits.MaxConnections, seedRows, table)
+
+	benchmarks := []struct {
+		name string
+		run  func(context.Context, storage.Storage, int) error
+	}{
+		{"Sequential queries", sequentialQueries},
+		{"Concurrent queries", concurrentQueries},
+		{"Batch insert", batchInsert},
+		{"Transactions", transactions},
+		{"Query latency under load", latencyUnderLoad},
+	}
+	for i, b := range benchmarks {
+		fmt.Printf("\n%d. %s\n", i+1, b.name)
+		if err := b.run(ctx, store, n); err != nil {
+			return fmt.Errorf("%s: %w", b.name, err)
+		}
+	}
+	return nil
+}
+
+// setup creates the table, replacing any left by an interrupted run, and
+// fills it in one batch.
+func setup(ctx context.Context, store storage.Storage) error {
+	drop(store)
+	err := store.CreateTable(ctx, storage.TableSchema{
+		Name: table,
+		Columns: []storage.ColumnDefinition{
+			{Name: "id", DataType: storage.DataTypeInteger, PrimaryKey: true, AutoIncrement: true},
+			{Name: "name", DataType: storage.DataTypeString, Length: 100},
+			{Name: "email", DataType: storage.DataTypeString, Length: 255},
+			{Name: "age", DataType: storage.DataTypeInteger},
+			{Name: "active", DataType: storage.DataTypeBoolean},
+		},
+		Indexes: []storage.IndexDefinition{{Name: table + "_active_idx", Columns: []string{"active"}}},
+	})
+	if err != nil {
+		return fmt.Errorf("create table %s: %w", table, err)
+	}
+
+	operations := make([]storage.Operation, seedRows)
+	for i := range operations {
+		command, err := insertUser(fmt.Sprintf("seed%d", i), i).Build()
+		if err != nil {
+			return err
+		}
+		operations[i] = storage.Operation{Type: storage.OperationTypeCommand, Command: command}
+	}
+	if _, err := store.Batch(ctx, operations); err != nil {
+		return fmt.Errorf("seed %s: %w", table, err)
+	}
+	return nil
+}
+
+func drop(store storage.Storage) {
+	if err := store.DropTable(context.Background(), table); err != nil {
+		log.Printf("drop table %s: %v", table, err)
+	}
+}
+
+func insertUser(key string, i int) *storage.CommandBuilder {
+	return storage.Insert(table).
+		Set("name", "User "+key).
+		Set("email", key+"@example.com").
+		Set("age", 20+i%50).
+		Set("active", i%4 != 0)
+}
+
+// readAll runs a query and reads every row, returning the number of rows.
+func readAll(ctx context.Context, store storage.Storage, query storage.Query) (int, error) {
+	rows, err := store.Query(ctx, query)
+	if err != nil {
+		return 0, err
+	}
+	defer rows.Close()
+	n := 0
+	for rows.Next() {
+		var id int
+		var name string
+		if err := rows.Scan(&id, &name); err != nil {
+			return n, err
+		}
+		n++
+	}
+	return n, rows.Err()
+}
+
+func pageQuery(page int) (storage.Query, error) {
+	return storage.NewBuilder().
+		Select("id", "name").
+		From(table).
+		Where(storage.Equal("active", true)).
+		WhereOr(storage.LessThan("age", 30), storage.GreaterThan("age", 60)).
+		OrderByAsc("id").
+		Page(page, 10).
+		Build()
+}
+
+func report(operations int, elapsed time.Duration, unit string) {
+	fmt.Printf("   %d %s in %v (%.0f %s/s)\n",
+		operations, unit, elapsed.Round(time.Millisecond), float64(operations)/elapsed.Seconds(), unit)
+}
+
+func reportAverage(operations int, elapsed time.Duration) {
+	fmt.Printf("   average latency %v\n", (elapsed / time.Duration(operations)).Round(time.Microsecond))
+}
+
+func sequentialQueries(ctx context.Context, store storage.Storage, n int) error {
+	start := time.Now()
+	for i := 0; i < n; i++ {
+		query, err := pageQuery(i%10 + 1)
+		if err != nil {
+			return err
+		}
+		if _, err := readAll(ctx, store, query); err != nil {
+			return err
+		}
+	}
+	elapsed := time.Since(start)
+	report(n, elapsed, "queries")
+	reportAverage(n, elapsed)
+	return nil
+}
+
+func concurrentQueries(ctx context.Context, store storage.Storage, n int) error {
+	const workers = 10
+	query, err := pageQuery(1)
+	if err != nil {
+		return err
+	}
+
+	var wg sync.WaitGroup
+	var failed atomic.Int64
+	var firstErr error
+	var once sync.Once
+	start := time.Now()
+	for w := 0; w < workers; w++ {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			for i := 0; i < n/workers; i++ {
+				if _, err := readAll(ctx, store, query); err != nil {
+					failed.Add(1)
+					once.Do(func() { firstErr = err })
+				}
+			}
+		}()
+	}
+	wg.Wait()
+	if firstErr != nil {
+		return fmt.Errorf("%d queries failed, the first with: %w", failed.Load(), firstErr)
+	}
+	report(n/workers*workers, time.Since(start), "queries")
+	return nil
+}
+
+func batchInsert(ctx context.Context, store storage.Storage, n int) error {
+	operations := make([]storage.Operation, n/10)
+	for i := range operations {
+		command, err := insertUser(fmt.Sprintf("batch%d", i), i).Build()
+		if err != nil {
+			return err
+		}
+		operations[i] = storage.Operation{Type: storage.OperationTypeCommand, Command: command}
+	}
+
+	start := time.Now()
+	if _, err := store.Batch(ctx, operations); err != nil {
+		return err
+	}
+	report(len(operations), time.Since(start), "inserts")
+	return nil
+}
+
+func transactions(ctx context.Context, store storage.Storage, n int) error {
+	count := n / 10
+	start := time.Now()
+	for i := 0; i < count; i++ {
+		if err := transferOnce(ctx, store, i); err != nil {
+			return err
+		}
+	}
+	elapsed := time.Since(start)
+	report(count, elapsed, "transactions")
+	reportAverage(count, elapsed)
+	return nil
+}
+
+// transferOnce inserts a user and deactivates another in one transaction.
+func transferOnce(ctx context.Context, store storage.Storage, i int) error {
+	tx, err := store.BeginTx(ctx, &storage.TxOptions{Isolation: storage.IsolationLevelReadCommitted})
+	if err != nil {
+		return err
+	}
+	defer func() { _ = tx.Rollback() }() // does nothing once the transaction is committed
+
+	insert, err := insertUser(fmt.Sprintf("tx%d", i), i).Build()
+	if err != nil {
+		return err
+	}
+	update, err := storage.Update(table).Set("active", false).Where(storage.Equal("id", i+1)).Build()
+	if err != nil {
+		return err
+	}
+	for _, command := range []storage.Command{insert, update} {
+		if _, err := tx.Execute(ctx, command); err != nil {
+			return err
+		}
+	}
+	return tx.Commit()
+}
+
+func latencyUnderLoad(ctx context.Context, store storage.Storage, n int) error {
+	const workers = 20
+	query, err := storage.NewBuilder().Select("id", "name").From(table).Where(storage.Equal("id", 1)).Build()
+	if err != nil {
+		return err
+	}
+
+	var mu sync.Mutex
+	var latencies []time.Duration
+	var firstErr error
+	var wg sync.WaitGroup
+	start := time.Now()
+	for w := 0; w < workers; w++ {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			for i := 0; i < n/workers; i++ {
+				queryStart := time.Now()
+				_, err := readAll(ctx, store, query)
+				latency := time.Since(queryStart)
+
+				mu.Lock()
+				if err != nil && firstErr == nil {
+					firstErr = err
+				}
+				latencies = append(latencies, latency)
+				mu.Unlock()
+			}
+		}()
+	}
+	wg.Wait()
+	if firstErr != nil {
+		return firstErr
+	}
+	elapsed := time.Since(start)
+
+	slices.Sort(latencies)
+	percentile := func(p int) time.Duration {
+		return latencies[(len(latencies)-1)*p/100].Round(time.Microsecond)
+	}
+	report(len(latencies), elapsed, "queries")
+	fmt.Printf("   latency with %d workers: p50 %v, p95 %v, p99 %v, max %v\n",
+		workers, percentile(50), percentile(95), percentile(99), percentile(100))
+	return nil
 }

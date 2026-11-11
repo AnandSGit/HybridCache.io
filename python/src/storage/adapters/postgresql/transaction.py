@@ -1,23 +1,36 @@
 """
-PostgreSQL transaction implementation.
+PostgreSQL transactions.
 
-This module provides transaction management for PostgreSQL using asyncpg
-with support for all isolation levels and savepoints.
+``PostgreSQLStorage.begin_tx`` takes a connection from the pool and runs
+``BEGIN`` once, with the isolation level and access mode of ``TxOptions``; the
+transaction gives the connection back to the pool when it ends. Leaving
+``async with`` commits or rolls back (see ``storage.interfaces.Transaction``).
+
+When ``TxOptions.timeout`` (else ``Config.tx_timeout``) is set, the transaction
+must end within it: each statement is bounded by the time left, and once it is
+used up statements and ``commit`` raise ``TransactionTimeoutError`` and the
+transaction is rolled back by closing its connection.
 """
 
 from __future__ import annotations
 
 import asyncio
+import datetime
 import uuid
-from typing import List, Optional
+from collections.abc import AsyncIterator, Awaitable, Callable
+from contextlib import asynccontextmanager
 
-import asyncpg
-
+from storage.adapters.postgresql.errors import OpKind, translate_errors
+from storage.adapters.postgresql.executor import Connection, Executor, Statement
 from storage.adapters.postgresql.result import PostgreSQLResult, PostgreSQLRow
+from storage.adapters.postgresql.sql import quote_identifier
 from storage.errors import (
-    TransactionError,
-    new_transaction_error,
-    new_transaction_timeout_error,
+    InvalidParametersError,
+    InvalidTransactionError,
+    StorageTimeoutError,
+    TransactionClosedError,
+    TransactionFailedError,
+    TransactionTimeoutError,
 )
 from storage.interfaces import Transaction
 from storage.types import (
@@ -26,324 +39,223 @@ from storage.types import (
     IsolationLevel,
     Operation,
     OperationResult,
-    OperationType,
     Query,
     TxOptions,
 )
 
+_ISOLATION_CLAUSES = {
+    IsolationLevel.DEFAULT: "",
+    IsolationLevel.READ_UNCOMMITTED: " ISOLATION LEVEL READ UNCOMMITTED",
+    IsolationLevel.READ_COMMITTED: " ISOLATION LEVEL READ COMMITTED",
+    IsolationLevel.REPEATABLE_READ: " ISOLATION LEVEL REPEATABLE READ",
+    IsolationLevel.SERIALIZABLE: " ISOLATION LEVEL SERIALIZABLE",
+}
+
+
+def begin_statement(options: TxOptions) -> str:
+    """The ``BEGIN`` statement for ``options``; ``IsolationLevel.DEFAULT`` uses
+    the session's default isolation level.
+
+    Raises:
+        InvalidTransactionError: For an unknown isolation level.
+    """
+    clause = _ISOLATION_CLAUSES.get(options.isolation)
+    if clause is None:
+        raise InvalidTransactionError(f"unknown isolation level {options.isolation!r}")
+    return "BEGIN" + clause + (" READ ONLY" if options.read_only else "")
+
 
 class PostgreSQLTransaction(Transaction):
-    """PostgreSQL transaction implementation using asyncpg."""
-    
+    """A transaction on one pooled connection; created by ``begin_tx``.
+
+    Operations on one transaction run one at a time. A failed query or command
+    raises the same error as outside a transaction (a ``QueryError``, or a data
+    or schema error), not a ``TransactionError``. PostgreSQL aborts the
+    transaction on any error: later statements raise ``TransactionFailedError``,
+    and so does ``commit``, as PostgreSQL rolls the transaction back.
+    """
+
     def __init__(
-        self, 
-        connection: asyncpg.Connection, 
-        pool: asyncpg.Pool,
-        options: TxOptions
+        self,
+        connection: Connection,
+        release: Callable[[Connection], Awaitable[None]],
+        *,
+        query_timeout: datetime.timedelta | None,
+        deadline: float | None,
     ) -> None:
-        """Initialize PostgreSQL transaction.
-        
-        Args:
-            connection: Database connection
-            pool: Connection pool (for releasing connection)
-            options: Transaction options
-        """
-        self._connection = connection
-        self._pool = pool
-        self._options = options
-        self._transaction: Optional[asyncpg.transaction.Transaction] = None
-        self._active = False
-        self._id = str(uuid.uuid4())
-        self._savepoints: List[str] = []
-    
-    async def __aenter__(self) -> PostgreSQLTransaction:
-        """Async context manager entry."""
-        await self._begin()
-        return self
-    
-    async def __aexit__(self, exc_type, exc_val, exc_tb) -> None:
-        """Async context manager exit."""
-        if exc_type is not None:
-            await self.rollback()
-        else:
-            await self.commit()
-    
+        """Wrap ``connection``, on which ``BEGIN`` has run; ``release`` gives it
+        back to its pool. ``deadline`` (event-loop time) is when the
+        transaction times out."""
+        self._connection: Connection = connection
+        self._release = release
+        self._deadline = deadline
+        self._executor = Executor(query_timeout, deadline)
+        self._active = True
+        self._id = "tx_" + uuid.uuid4().hex
+        self._lock = asyncio.Lock()
+
     async def query(self, query: Query) -> PostgreSQLResult:
-        """Execute a query within the transaction.
-        
-        Args:
-            query: The query to execute
-            
-        Returns:
-            Query results
-            
-        Raises:
-            QueryError: If query execution fails
-            TransactionError: If transaction is not active
-        """
-        if not self._active:
-            raise new_transaction_error("TX_NOT_ACTIVE", "Transaction is not active")
-        
-        try:
-            # Convert ? placeholders to $n format
-            sql = self._convert_placeholders(query.sql)
-            
-            # Execute query with timeout
-            if query.timeout:
-                result = await asyncio.wait_for(
-                    self._connection.fetch(sql, *query.parameters),
-                    timeout=query.timeout.total_seconds()
-                )
-            else:
-                result = await self._connection.fetch(sql, *query.parameters)
-            
-            return PostgreSQLResult(result, self._connection)
-            
-        except asyncio.TimeoutError as e:
-            raise new_transaction_error("QUERY_TIMEOUT", f"Query timeout in transaction: {query.sql[:100]}...") from e
-        except Exception as e:
-            raise new_transaction_error("QUERY_FAILED", f"Query failed in transaction: {e}") from e
-    
-    async def query_one(self, query: Query) -> Optional[PostgreSQLRow]:
-        """Execute a query and return a single row.
-        
-        Args:
-            query: The query to execute
-            
-        Returns:
-            Single row or None
-            
-        Raises:
-            QueryError: If query execution fails
-            TransactionError: If transaction is not active
-        """
-        result = await self.query(query)
-        return await result.fetchone()
-    
+        """Execute a query within the transaction."""
+        statement = Statement.of(query)
+        async with self._using() as conn:
+            deadline = self._executor.deadline(statement.timeout)
+            return await self._executor.fetch(conn, statement, deadline)
+
+    async def query_one(self, query: Query) -> PostgreSQLRow | None:
+        """Execute a query and return its first row, or ``None``."""
+        statement = Statement.of(query)
+        async with self._using() as conn:
+            deadline = self._executor.deadline(statement.timeout)
+            return await self._executor.fetch_one(conn, statement, deadline)
+
     async def execute(self, command: Command) -> ExecuteResult:
-        """Execute a command within the transaction.
-        
-        Args:
-            command: The command to execute
-            
-        Returns:
-            Execution result
-            
+        """Execute a command within the transaction."""
+        statement = Statement.of(command)
+        async with self._using() as conn:
+            deadline = self._executor.deadline(statement.timeout)
+            return await self._executor.execute(conn, statement, deadline)
+
+    async def batch(self, operations: list[Operation]) -> list[OperationResult]:
+        """Execute operations in order within the transaction.
+
+        The first failed operation aborts the transaction: its result carries its
+        error, the operations after it are not run (their results carry a
+        ``QueryFailedError``), and ``commit`` raises ``TransactionFailedError``.
+
         Raises:
-            QueryError: If command execution fails
-            TransactionError: If transaction is not active
+            TransactionClosedError: If the transaction is not active.
+            InvalidQueryError: Before running anything, for an invalid operation.
         """
-        if not self._active:
-            raise new_transaction_error("TX_NOT_ACTIVE", "Transaction is not active")
-        
-        try:
-            # Convert ? placeholders to $n format
-            sql = self._convert_placeholders(command.sql)
-            
-            # Execute command with timeout
-            if command.timeout:
-                result = await asyncio.wait_for(
-                    self._connection.execute(sql, *command.parameters),
-                    timeout=command.timeout.total_seconds()
-                )
-            else:
-                result = await self._connection.execute(sql, *command.parameters)
-            
-            # Parse result to get rows affected
-            rows_affected = self._parse_execute_result(result)
-            
-            return ExecuteResult(rows_affected=rows_affected)
-            
-        except asyncio.TimeoutError as e:
-            raise new_transaction_error("COMMAND_TIMEOUT", f"Command timeout in transaction: {command.sql[:100]}...") from e
-        except Exception as e:
-            raise new_transaction_error("COMMAND_FAILED", f"Command failed in transaction: {e}") from e
-    
-    async def batch(self, operations: List[Operation]) -> List[OperationResult]:
-        """Execute multiple operations within the transaction.
-        
-        Args:
-            operations: List of operations to execute
-            
-        Returns:
-            List of operation results
-            
-        Raises:
-            QueryError: If any operation fails
-            TransactionError: If transaction is not active
-        """
-        if not self._active:
-            raise new_transaction_error("TX_NOT_ACTIVE", "Transaction is not active")
-        
-        results = []
-        
-        for i, operation in enumerate(operations):
-            try:
-                if operation.operation_type == OperationType.QUERY and operation.query:
-                    result = await self.query(operation.query)
-                    results.append(OperationResult(index=i, result=result))
-                elif operation.operation_type == OperationType.COMMAND and operation.command:
-                    result = await self.execute(operation.command)
-                    results.append(OperationResult(index=i, result=result))
-                else:
-                    raise ValueError(f"Invalid operation at index {i}")
-            except Exception as e:
-                results.append(OperationResult(index=i, error=e))
-        
-        return results
-    
-    async def commit(self) -> None:
-        """Commit the transaction.
-        
-        Raises:
-            TransactionError: If commit fails
-        """
-        if not self._active:
-            raise new_transaction_error("TX_NOT_ACTIVE", "Transaction is not active")
-        
-        try:
-            if self._transaction:
-                await self._transaction.commit()
-            self._active = False
-            
-            # Release connection back to pool
-            await self._pool.release(self._connection)
-            
-        except Exception as e:
-            raise new_transaction_error("COMMIT_FAILED", f"Failed to commit transaction: {e}") from e
-    
-    async def rollback(self) -> None:
-        """Rollback the transaction.
-        
-        Raises:
-            TransactionError: If rollback fails
-        """
-        if not self._active:
-            return  # Already rolled back or committed
-        
-        try:
-            if self._transaction:
-                await self._transaction.rollback()
-            self._active = False
-            
-            # Release connection back to pool
-            await self._pool.release(self._connection)
-            
-        except Exception as e:
-            raise new_transaction_error("ROLLBACK_FAILED", f"Failed to rollback transaction: {e}") from e
-    
-    async def savepoint(self, name: str) -> None:
-        """Create a savepoint.
-        
-        Args:
-            name: Savepoint name
-            
-        Raises:
-            TransactionError: If savepoint creation fails
-        """
-        if not self._active:
-            raise new_transaction_error("TX_NOT_ACTIVE", "Transaction is not active")
-        
-        try:
-            await self._connection.execute(f"SAVEPOINT {name}")
-            self._savepoints.append(name)
-        except Exception as e:
-            raise new_transaction_error("SAVEPOINT_FAILED", f"Failed to create savepoint {name}: {e}") from e
-    
-    async def rollback_to_savepoint(self, name: str) -> None:
-        """Rollback to a savepoint.
-        
-        Args:
-            name: Savepoint name
-            
-        Raises:
-            TransactionError: If rollback fails
-        """
-        if not self._active:
-            raise new_transaction_error("TX_NOT_ACTIVE", "Transaction is not active")
-        
-        if name not in self._savepoints:
-            raise new_transaction_error("SAVEPOINT_NOT_FOUND", f"Savepoint {name} not found")
-        
-        try:
-            await self._connection.execute(f"ROLLBACK TO SAVEPOINT {name}")
-            
-            # Remove savepoints created after this one
-            index = self._savepoints.index(name)
-            self._savepoints = self._savepoints[:index + 1]
-            
-        except Exception as e:
-            raise new_transaction_error("ROLLBACK_TO_SAVEPOINT_FAILED", f"Failed to rollback to savepoint {name}: {e}") from e
-    
-    def is_active(self) -> bool:
-        """Check if the transaction is active.
-        
-        Returns:
-            True if transaction is active
-        """
-        return self._active
-    
-    def get_id(self) -> str:
-        """Get the transaction ID.
-        
-        Returns:
-            Transaction ID
-        """
-        return self._id
-    
-    async def _begin(self) -> None:
-        """Begin the transaction."""
-        try:
-            # Map isolation level to PostgreSQL syntax
-            isolation_map = {
-                IsolationLevel.READ_UNCOMMITTED: "READ UNCOMMITTED",
-                IsolationLevel.READ_COMMITTED: "READ COMMITTED",
-                IsolationLevel.REPEATABLE_READ: "REPEATABLE READ",
-                IsolationLevel.SERIALIZABLE: "SERIALIZABLE",
-            }
-            
-            isolation = isolation_map.get(self._options.isolation, "READ COMMITTED")
-            
-            # Begin transaction with isolation level
-            self._transaction = self._connection.transaction(
-                isolation=isolation,
-                readonly=self._options.read_only,
+        async with self._using() as conn:
+            return await self._executor.batch(
+                conn, operations, stop_at_first_error=True
             )
-            
-            await self._transaction.start()
-            self._active = True
-            
-            # Set timeout if specified
-            if self._options.timeout:
-                # PostgreSQL doesn't have per-transaction timeouts,
-                # but we could implement this with asyncio.wait_for
-                pass
-                
-        except Exception as e:
-            raise new_transaction_error("BEGIN_FAILED", f"Failed to begin transaction: {e}") from e
-    
-    def _convert_placeholders(self, sql: str) -> str:
-        """Convert ? placeholders to $n format for PostgreSQL."""
-        param_index = 1
-        result = []
-        
-        for char in sql:
-            if char == "?":
-                result.append(f"${param_index}")
-                param_index += 1
-            else:
-                result.append(char)
-        
-        return "".join(result)
-    
-    def _parse_execute_result(self, result: str) -> int:
-        """Parse execute result to get rows affected."""
-        # asyncpg returns strings like "INSERT 0 1" or "UPDATE 3"
-        if result.startswith("INSERT"):
-            parts = result.split()
-            return int(parts[2]) if len(parts) >= 3 else 0
-        elif result.startswith(("UPDATE", "DELETE")):
-            parts = result.split()
-            return int(parts[1]) if len(parts) >= 2 else 0
-        else:
-            return 0
+
+    async def commit(self) -> None:
+        """Commit the transaction; it is over afterwards, whatever the outcome.
+
+        Raises:
+            TransactionClosedError: If the transaction is not active.
+            TransactionFailedError: If PostgreSQL rolled the transaction back
+                because a statement had failed, or the commit failed (a
+                serialization failure is retryable).
+            TransactionTimeoutError: If the transaction's time is up; it is
+                rolled back.
+        """
+        async with self._lock:
+            self._check_active()
+            if self._expired():
+                await self._end(terminate=True)
+                raise TransactionTimeoutError()
+            try:
+                status = await self._control("COMMIT", "commit failed")
+            except BaseException as exc:
+                await self._end(terminate=isinstance(exc, StorageTimeoutError))
+                raise
+            await self._end()
+        if status == "ROLLBACK":
+            raise TransactionFailedError(
+                "transaction was rolled back because an earlier statement failed"
+            )
+
+    async def rollback(self) -> None:
+        """Roll back the transaction; a no-op when it is no longer active.
+
+        Once the transaction's time is up, it is rolled back by closing its
+        connection instead.
+
+        Raises:
+            TransactionFailedError: If the rollback fails; the connection is
+                closed, which also rolls the transaction back.
+        """
+        async with self._lock:
+            if not self._active:
+                return
+            if self._expired():
+                await self._end(terminate=True)
+                return
+            try:
+                await self._control("ROLLBACK", "rollback failed")
+            except TransactionTimeoutError:
+                await self._end(terminate=True)
+                return
+            except BaseException:
+                await self._end(terminate=True)
+                raise
+            await self._end()
+
+    async def savepoint(self, name: str) -> None:
+        """Create a savepoint; ``name`` is quoted as an identifier.
+
+        Raises:
+            InvalidParametersError: If ``name`` is empty, contains NUL or is
+                longer than 63 bytes.
+        """
+        await self._savepoint_command("SAVEPOINT", name, "savepoint failed")
+
+    async def rollback_to_savepoint(self, name: str) -> None:
+        """Roll back to a savepoint, which stays defined.
+
+        Raises:
+            InvalidParametersError: For an invalid name.
+            TransactionFailedError: If the savepoint does not exist (PostgreSQL
+                then aborts the transaction).
+        """
+        await self._savepoint_command(
+            "ROLLBACK TO SAVEPOINT", name, "rollback to savepoint failed"
+        )
+
+    def is_active(self) -> bool:
+        """Whether the transaction is still open."""
+        return self._active
+
+    def get_id(self) -> str:
+        """Return the transaction ID."""
+        return self._id
+
+    async def _savepoint_command(self, command: str, name: str, message: str) -> None:
+        async with self._using():
+            savepoint = quote_identifier(name, "savepoint", InvalidParametersError)
+            await self._control(f"{command} {savepoint}", message)
+
+    @asynccontextmanager
+    async def _using(self) -> AsyncIterator[Connection]:
+        """Hold the transaction for one operation; a timeout ends it."""
+        async with self._lock:
+            self._check_active()
+            if self._expired():
+                await self._end(terminate=True)
+                raise TransactionTimeoutError()
+            try:
+                yield self._connection
+            except TransactionTimeoutError:
+                await self._end(terminate=True)
+                raise
+
+    async def _control(self, sql: str, message: str) -> str:
+        """Run a transaction control statement, bounded by the deadline."""
+        with translate_errors(OpKind.TRANSACTION, message, sql):
+            async with asyncio.timeout_at(self._deadline):
+                status: str = await self._connection.execute(sql)
+        return status
+
+    def _check_active(self) -> None:
+        if not self._active:
+            raise TransactionClosedError()
+
+    def _expired(self) -> bool:
+        return (
+            self._deadline is not None
+            and asyncio.get_running_loop().time() >= self._deadline
+        )
+
+    async def _end(self, *, terminate: bool = False) -> None:
+        """End the transaction and give its connection back to the pool; closing
+        the connection (``terminate``) rolls back whatever is still open."""
+        self._active = False
+        connection, self._connection = self._connection, None
+        if connection is None:
+            return
+        if terminate:
+            connection.terminate()
+        await self._release(connection)

@@ -1,22 +1,27 @@
 """
 Type definitions for the Database Agnostic Storage Library.
 
-This module contains all the data types, enums, and dataclasses used throughout
-the library, providing strong typing and clear interfaces.
+These mirror ``internal/domain/types.go`` of the Go implementation with Pythonic
+naming. SQL adapters execute ``Query.sql`` / ``Command.sql`` with their
+``parameters``; document adapters (MongoDB) cannot execute SQL text and execute the
+structured ``spec`` that the query builder always populates.
 """
 
 from __future__ import annotations
 
+import dataclasses
 import datetime
 from dataclasses import dataclass, field
-from enum import Enum, auto
-from typing import Any, Dict, List, Optional, Union
-from uuid import UUID
+from enum import Enum
+from typing import TYPE_CHECKING, Any
+
+if TYPE_CHECKING:
+    from storage.interfaces import Result
 
 
 class DatabaseType(Enum):
     """Supported database types."""
-    
+
     POSTGRESQL = "postgresql"
     MYSQL = "mysql"
     SQLITE = "sqlite"
@@ -30,7 +35,7 @@ class DatabaseType(Enum):
 
 class DataType(Enum):
     """Universal data types supported across databases."""
-    
+
     STRING = "string"
     INTEGER = "integer"
     FLOAT = "float"
@@ -50,7 +55,7 @@ class DataType(Enum):
 
 class QueryType(Enum):
     """Types of database queries."""
-    
+
     SELECT = "select"
     INSERT = "insert"
     UPDATE = "update"
@@ -63,7 +68,7 @@ class QueryType(Enum):
 
 class CommandType(Enum):
     """Types of database commands."""
-    
+
     INSERT = "insert"
     UPDATE = "update"
     DELETE = "delete"
@@ -75,14 +80,15 @@ class CommandType(Enum):
 
 class OperationType(Enum):
     """Types of batch operations."""
-    
+
     QUERY = "query"
     COMMAND = "command"
 
 
 class IsolationLevel(Enum):
-    """Transaction isolation levels."""
-    
+    """Transaction isolation levels. ``DEFAULT`` uses the database's own default."""
+
+    DEFAULT = "default"
     READ_UNCOMMITTED = "read_uncommitted"
     READ_COMMITTED = "read_committed"
     REPEATABLE_READ = "repeatable_read"
@@ -91,14 +97,18 @@ class IsolationLevel(Enum):
 
 class SortDirection(Enum):
     """Sort directions for ORDER BY clauses."""
-    
+
     ASC = "asc"
     DESC = "desc"
 
 
 class Operator(Enum):
-    """Comparison operators for WHERE conditions."""
-    
+    """Operators for conditions.
+
+    ``AND`` and ``OR`` combine the operands in ``Condition.conditions``;
+    ``EXISTS`` and ``NOT_EXISTS`` take a query builder (the subquery) as value.
+    """
+
     EQUAL = "equal"
     NOT_EQUAL = "not_equal"
     GREATER_THAN = "greater_than"
@@ -115,11 +125,13 @@ class Operator(Enum):
     IS_NOT_NULL = "is_not_null"
     EXISTS = "exists"
     NOT_EXISTS = "not_exists"
+    AND = "and"
+    OR = "or"
 
 
 class JoinType(Enum):
     """Types of SQL joins."""
-    
+
     INNER = "inner"
     LEFT = "left"
     RIGHT = "right"
@@ -127,18 +139,9 @@ class JoinType(Enum):
     CROSS = "cross"
 
 
-class ConflictResolution(Enum):
-    """Conflict resolution strategies for INSERT/UPDATE."""
-    
-    IGNORE = "ignore"
-    REPLACE = "replace"
-    UPDATE = "update"
-    FAIL = "fail"
-
-
 class SchemaChangeType(Enum):
     """Types of schema changes."""
-    
+
     ADD_COLUMN = "add_column"
     DROP_COLUMN = "drop_column"
     MODIFY_COLUMN = "modify_column"
@@ -148,7 +151,7 @@ class SchemaChangeType(Enum):
 
 class IndexType(Enum):
     """Types of database indexes."""
-    
+
     BTREE = "btree"
     HASH = "hash"
     GIN = "gin"
@@ -158,7 +161,7 @@ class IndexType(Enum):
 
 class HealthStatusType(Enum):
     """Health status types."""
-    
+
     HEALTHY = "healthy"
     DEGRADED = "degraded"
     UNHEALTHY = "unhealthy"
@@ -166,16 +169,14 @@ class HealthStatusType(Enum):
 
 
 class ErrorType(Enum):
-    """Types of storage errors."""
-    
+    """Categories of storage errors."""
+
     CONNECTION = "connection"
     QUERY = "query"
     TRANSACTION = "transaction"
     DATA = "data"
     SCHEMA = "schema"
     ADAPTER = "adapter"
-    MIGRATION = "migration"
-    CACHE = "cache"
     VALIDATION = "validation"
     TIMEOUT = "timeout"
     PERMISSION = "permission"
@@ -183,85 +184,174 @@ class ErrorType(Enum):
     UNKNOWN = "unknown"
 
 
+@dataclass(frozen=True)
+class ColumnRef:
+    """Marks a condition value as a column reference, never a bound parameter.
+
+    Example: ``Condition("a.id", Operator.EQUAL, ColumnRef("b.a_id"))`` renders
+    ``a.id = b.a_id`` (as in ``JOIN b ON a.id = b.a_id``).
+    """
+
+    name: str
+
+
 @dataclass
 class Condition:
-    """Represents a WHERE condition in a query."""
-    
+    """A condition in a WHERE, HAVING or JOIN ... ON clause.
+
+    ``value`` is a bound parameter, unless it is a ``ColumnRef`` (rendered as a
+    column) or the operator is ``EXISTS``/``NOT_EXISTS`` (``value`` is a query
+    builder). ``values`` holds the operands of ``IN``/``NOT_IN`` and
+    ``BETWEEN``/``NOT_BETWEEN``. For ``AND``/``OR`` the operands are in
+    ``conditions`` and ``field`` is unused.
+    """
+
     field: str
     operator: Operator
     value: Any = None
-    values: Optional[List[Any]] = None
+    values: list[Any] | None = None
+    # dataclasses.field, because the ``field`` attribute above shadows the bare
+    # name inside this class body for type checkers.
+    conditions: list[Condition] = dataclasses.field(default_factory=list)
+
+
+@dataclass
+class OrderBy:
+    """A single ORDER BY term."""
+
+    field: str
+    direction: SortDirection = SortDirection.ASC
+
+
+@dataclass
+class Join:
+    """A single JOIN clause; ``on`` is ``None`` only for ``JoinType.CROSS``."""
+
+    join_type: JoinType
+    table: str
+    on: Condition | None = None
+
+
+@dataclass
+class QuerySpec:
+    """The structured, database-neutral form of a SELECT built by the query builder.
+
+    ``where`` and ``having`` are combined with AND. ``table`` is the bare table name
+    and is empty when the data source is a subquery (``subquery`` is then true).
+    ``joins``, ``group_by``, ``having`` and ``subquery`` are SQL-only features:
+    document adapters raise ``UnsupportedQueryError`` for a spec that uses them
+    instead of ignoring them.
+    """
+
+    table: str = ""
+    fields: list[str] = field(default_factory=list)  # empty: all fields
+    distinct: bool = False
+    where: list[Condition] = field(default_factory=list)
+    order_by: list[OrderBy] = field(default_factory=list)
+    limit: int | None = None
+    offset: int | None = None
+    joins: list[Join] = field(default_factory=list)
+    group_by: list[str] = field(default_factory=list)
+    having: list[Condition] = field(default_factory=list)
+    subquery: bool = False
+
+
+@dataclass
+class FieldValue:
+    """A single column assignment of an INSERT or UPDATE."""
+
+    field: str
+    value: Any
+
+
+@dataclass
+class CommandSpec:
+    """The structured form of an INSERT/UPDATE/DELETE built by the command builder.
+
+    ``values`` are the ordered column assignments (INSERT/UPDATE); ``where`` is
+    combined with AND (UPDATE/DELETE).
+    """
+
+    table: str
+    values: list[FieldValue] = field(default_factory=list)
+    where: list[Condition] = field(default_factory=list)
 
 
 @dataclass
 class Query:
-    """Represents a database query."""
-    
-    sql: str
-    parameters: List[Any] = field(default_factory=list)
+    """A database query.
+
+    SQL adapters execute ``sql`` with ``parameters`` (the builder emits ``?``
+    placeholders). Document adapters execute ``spec`` and reject raw SQL. A
+    ``timeout`` of ``None`` falls back to ``Config.query_timeout``.
+    """
+
+    sql: str = ""
+    parameters: list[Any] = field(default_factory=list)
     query_type: QueryType = QueryType.UNKNOWN
-    timeout: Optional[datetime.timedelta] = None
-    cache_key: Optional[str] = None
-    cache_ttl: Optional[datetime.timedelta] = None
-    read_only: bool = False
+    timeout: datetime.timedelta | None = None
+    spec: QuerySpec | None = None
 
 
 @dataclass
 class Command:
-    """Represents a database command (INSERT, UPDATE, DELETE)."""
-    
-    sql: str
-    parameters: List[Any] = field(default_factory=list)
+    """A database command (INSERT, UPDATE, DELETE, DDL); see ``Query``."""
+
+    sql: str = ""
+    parameters: list[Any] = field(default_factory=list)
     command_type: CommandType = CommandType.UNKNOWN
-    timeout: Optional[datetime.timedelta] = None
-    return_id: bool = False
-    return_count: bool = True
-    on_conflict: ConflictResolution = ConflictResolution.FAIL
+    timeout: datetime.timedelta | None = None
+    spec: CommandSpec | None = None
 
 
 @dataclass
 class Operation:
-    """Represents a batch operation."""
-    
+    """A batch operation: ``query`` for QUERY, ``command`` for COMMAND."""
+
     operation_type: OperationType
-    query: Optional[Query] = None
-    command: Optional[Command] = None
+    query: Query | None = None
+    command: Command | None = None
 
 
 @dataclass
 class ExecuteResult:
-    """Result of executing a command."""
-    
+    """Result of executing a command.
+
+    ``last_insert_id`` is ``None`` when the database has no integer insert IDs
+    (PostgreSQL, MongoDB).
+    """
+
     rows_affected: int
-    last_insert_id: Optional[int] = None
+    last_insert_id: int | None = None
 
 
 @dataclass
 class OperationResult:
-    """Result of a batch operation."""
-    
+    """Result of one batch operation: a ``Result`` or an ``ExecuteResult``, or the
+    error that operation raised."""
+
     index: int
-    result: Optional[Union[ExecuteResult, Any]] = None
-    error: Optional[Exception] = None
+    result: Result | ExecuteResult | None = None
+    error: Exception | None = None
 
 
 @dataclass
 class ColumnType:
     """Information about a column type."""
-    
+
     name: str
     database_type: str
     data_type: DataType
     nullable: bool = True
-    length: Optional[int] = None
-    precision: Optional[int] = None
-    scale: Optional[int] = None
+    length: int | None = None
+    precision: int | None = None
+    scale: int | None = None
 
 
 @dataclass
 class ColumnDefinition:
     """Definition of a database column."""
-    
+
     name: str
     data_type: DataType
     nullable: bool = True
@@ -278,47 +368,48 @@ class ColumnDefinition:
 @dataclass
 class IndexDefinition:
     """Definition of a database index."""
-    
+
     name: str
-    columns: List[str]
+    columns: list[str]
     unique: bool = False
     index_type: IndexType = IndexType.BTREE
-    condition: Optional[str] = None
+    condition: str | None = None
 
 
 @dataclass
 class SchemaChange:
-    """Represents a schema change operation."""
-    
+    """A schema change operation, as passed to ``Storage.alter_table``."""
+
     change_type: SchemaChangeType
-    column: Optional[ColumnDefinition] = None
-    index: Optional[IndexDefinition] = None
+    column: ColumnDefinition | None = None
+    index: IndexDefinition | None = None
 
 
 @dataclass
 class TableSchema:
     """Schema definition for a database table."""
-    
+
     name: str
-    columns: List[ColumnDefinition] = field(default_factory=list)
-    indexes: List[IndexDefinition] = field(default_factory=list)
-    primary_key: List[str] = field(default_factory=list)
-    foreign_keys: Dict[str, str] = field(default_factory=dict)
+    columns: list[ColumnDefinition] = field(default_factory=list)
+    indexes: list[IndexDefinition] = field(default_factory=list)
+    primary_key: list[str] = field(default_factory=list)
+    foreign_keys: dict[str, str] = field(default_factory=dict)
 
 
 @dataclass
 class TxOptions:
-    """Transaction options."""
-    
-    isolation: IsolationLevel = IsolationLevel.READ_COMMITTED
+    """Transaction options. A ``timeout`` of ``None`` falls back to
+    ``Config.tx_timeout``."""
+
+    isolation: IsolationLevel = IsolationLevel.DEFAULT
     read_only: bool = False
-    timeout: Optional[datetime.timedelta] = None
+    timeout: datetime.timedelta | None = None
 
 
 @dataclass
 class StorageLimits:
     """Storage system limits."""
-    
+
     max_connections: int
     max_query_size: int
     max_transaction_age: datetime.timedelta
@@ -328,60 +419,61 @@ class StorageLimits:
 @dataclass
 class StorageInfo:
     """Information about a storage system."""
-    
+
     name: str
     version: str
     database_type: DatabaseType
-    features: List[str] = field(default_factory=list)
-    limits: Optional[StorageLimits] = None
+    features: list[str] = field(default_factory=list)
+    limits: StorageLimits | None = None
 
 
 @dataclass
 class HealthStatus:
-    """Health status of a storage system."""
-    
+    """Health status of a storage system; ``timestamp`` is timezone-aware (UTC)."""
+
     status: HealthStatusType
     message: str
-    timestamp: datetime.datetime = field(default_factory=datetime.datetime.now)
-    details: Dict[str, Any] = field(default_factory=dict)
+    timestamp: datetime.datetime = field(
+        default_factory=lambda: datetime.datetime.now(datetime.UTC)
+    )
+    details: dict[str, Any] = field(default_factory=dict)
 
 
 @dataclass
 class Config:
-    """Configuration for database connections."""
-    
+    """Configuration for database connections.
+
+    ``port`` of ``None`` means the adapter's default port (5432 for PostgreSQL,
+    27017 for MongoDB). A timeout or lifetime of ``None`` means no limit.
+    ``password`` and ``dsn`` (which may embed the password) are left out of
+    ``repr()``.
+    """
+
     # Connection details
     host: str = "localhost"
-    port: int = 5432
+    port: int | None = None
     database: str = ""
     username: str = ""
-    password: str = ""
-    dsn: str = ""
-    
+    password: str = field(default="", repr=False)
+    dsn: str = field(default="", repr=False)
+
     # Connection pool settings
     max_open_conns: int = 25
     max_idle_conns: int = 5
-    conn_max_lifetime: datetime.timedelta = datetime.timedelta(hours=1)
-    conn_max_idle_time: datetime.timedelta = datetime.timedelta(minutes=30)
-    
-    # Timeout settings
-    connect_timeout: datetime.timedelta = datetime.timedelta(seconds=10)
-    query_timeout: datetime.timedelta = datetime.timedelta(seconds=30)
-    tx_timeout: datetime.timedelta = datetime.timedelta(minutes=5)
-    
-    # SSL settings
+    conn_max_lifetime: datetime.timedelta | None = datetime.timedelta(hours=1)
+    conn_max_idle_time: datetime.timedelta | None = datetime.timedelta(minutes=30)
+
+    # Timeouts: query_timeout is the default for Query/Command.timeout,
+    # tx_timeout the default for TxOptions.timeout.
+    connect_timeout: datetime.timedelta | None = datetime.timedelta(seconds=10)
+    query_timeout: datetime.timedelta | None = datetime.timedelta(seconds=30)
+    tx_timeout: datetime.timedelta | None = datetime.timedelta(minutes=5)
+
+    # SSL/TLS settings
     ssl_mode: str = "prefer"
     ssl_cert: str = ""
     ssl_key: str = ""
     ssl_root_ca: str = ""
-    
-    # Additional options
-    options: Dict[str, Any] = field(default_factory=dict)
 
-
-# Type aliases for commonly used types
-ParameterValue = Union[str, int, float, bool, datetime.datetime, datetime.date, 
-                      datetime.time, bytes, UUID, None]
-Parameters = List[ParameterValue]
-Row = Dict[str, Any]
-Rows = List[Row]
+    # Additional, adapter-specific options
+    options: dict[str, Any] = field(default_factory=dict)

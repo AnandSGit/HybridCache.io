@@ -1,365 +1,294 @@
 package mongodb
 
 import (
+	"bytes"
 	"context"
 	"fmt"
-	"reflect"
+	"slices"
+	"strings"
 
 	"github.com/AnandSGit/HybridCache.io/internal/domain"
-	"go.mongodb.org/mongo-driver/bson"
-	"go.mongodb.org/mongo-driver/mongo"
+	"go.mongodb.org/mongo-driver/v2/bson"
+	"go.mongodb.org/mongo-driver/v2/mongo"
 )
 
-// MongoDBResult implements the domain.Result interface for MongoDB
-type MongoDBResult struct {
-	cursor *mongo.Cursor
-	err    error
+// bsonTypeNames maps BSON types to the aliases MongoDB uses for $type.
+var bsonTypeNames = map[bson.Type]string{
+	bson.TypeDouble:           "double",
+	bson.TypeString:           "string",
+	bson.TypeEmbeddedDocument: "object",
+	bson.TypeArray:            "array",
+	bson.TypeBinary:           "binData",
+	bson.TypeUndefined:        "undefined",
+	bson.TypeObjectID:         "objectId",
+	bson.TypeBoolean:          "bool",
+	bson.TypeDateTime:         "date",
+	bson.TypeNull:             "null",
+	bson.TypeRegex:            "regex",
+	bson.TypeDBPointer:        "dbPointer",
+	bson.TypeJavaScript:       "javascript",
+	bson.TypeSymbol:           "symbol",
+	bson.TypeCodeWithScope:    "javascriptWithScope",
+	bson.TypeInt32:            "int",
+	bson.TypeTimestamp:        "timestamp",
+	bson.TypeInt64:            "long",
+	bson.TypeDecimal128:       "decimal",
+	bson.TypeMinKey:           "minKey",
+	bson.TypeMaxKey:           "maxKey",
 }
 
-// Next advances to the next document
+// MongoDBResult implements domain.Result over a driver cursor, or over
+// materialised documents (COUNT, DISTINCT and batch results).
+type MongoDBResult struct {
+	cursor  *mongo.Cursor
+	ctx     context.Context    // query context, bounded by the query timeout
+	cancel  context.CancelFunc // releases ctx on Close
+	docs    []bson.Raw         // materialised documents when cursor is nil
+	pos     int
+	current bson.Raw
+	columns []string // projected columns in select order; nil means document order
+	err     error
+	closed  bool
+}
+
+func newCursorResult(ctx context.Context, cancel context.CancelFunc, cursor *mongo.Cursor, columns []string) *MongoDBResult {
+	return &MongoDBResult{cursor: cursor, ctx: ctx, cancel: cancel, columns: columns}
+}
+
+func newDocumentResult(docs []bson.Raw, columns []string) *MongoDBResult {
+	return &MongoDBResult{docs: docs, columns: columns}
+}
+
+// Next advances to the next document. As with database/sql, the result closes
+// itself once the documents are exhausted or iteration fails.
 func (r *MongoDBResult) Next() bool {
-	if r.cursor == nil {
+	r.current = nil
+	if r.closed {
 		return false
 	}
-	return r.cursor.Next(context.Background())
-}
-
-// Close closes the result cursor
-func (r *MongoDBResult) Close() error {
-	if r.cursor != nil {
-		return r.cursor.Close(context.Background())
-	}
-	return nil
-}
-
-// Scan scans the current document into the provided destinations
-func (r *MongoDBResult) Scan(dest ...interface{}) error {
 	if r.cursor == nil {
-		return domain.NewDataError("NO_CURSOR", "no cursor available")
-	}
-
-	// Get current document as BSON
-	var doc bson.M
-	if err := r.cursor.Decode(&doc); err != nil {
-		return domain.NewDataError("DECODE_FAILED", err.Error()).WithCause(err)
-	}
-
-	// Map document fields to destinations
-	if len(dest) == 1 {
-		// Single destination - decode entire document
-		if err := r.cursor.Decode(dest[0]); err != nil {
-			return domain.NewDataError("DECODE_FAILED", err.Error()).WithCause(err)
+		if r.pos < len(r.docs) {
+			r.current = r.docs[r.pos]
+			r.pos++
+			return true
 		}
+		r.finish()
+		return false
+	}
+	if r.cursor.Next(r.ctx) {
+		r.current = r.cursor.Current
+		return true
+	}
+	if err := r.cursor.Err(); err != nil {
+		r.err = queryError(err, "failed to read query results")
+	}
+	r.finish()
+	return false
+}
+
+// finish closes the result at the end of iteration, keeping the first error.
+func (r *MongoDBResult) finish() {
+	if err := r.Close(); err != nil && r.err == nil {
+		r.err = err
+	}
+}
+
+// Close closes the cursor and releases the query context. It is idempotent.
+func (r *MongoDBResult) Close() error {
+	if r.closed {
 		return nil
 	}
-
-	// Multiple destinations - map by field order or names
-	// This is a simplified implementation
-	i := 0
-	for _, value := range doc {
-		if i >= len(dest) {
-			break
-		}
-		if err := setFieldValue(reflect.ValueOf(dest[i]).Elem(), value); err != nil {
-			return domain.NewDataError("FIELD_MAPPING_FAILED", err.Error()).WithCause(err)
-		}
-		i++
-	}
-
-	return nil
-}
-
-// ScanRow scans the current document into a struct
-func (r *MongoDBResult) ScanRow(dest interface{}) error {
-	if r.cursor == nil {
-		return domain.NewDataError("NO_CURSOR", "no cursor available")
-	}
-
-	// Decode directly into the destination struct
-	if err := r.cursor.Decode(dest); err != nil {
-		return domain.NewDataError("DECODE_FAILED", err.Error()).WithCause(err)
-	}
-
-	return nil
-}
-
-// Columns returns the column names (for MongoDB, this returns document field names)
-func (r *MongoDBResult) Columns() ([]string, error) {
-	// For MongoDB, we can't determine columns without examining documents
-	// This is a simplified implementation
-	return []string{}, nil
-}
-
-// ColumnTypes returns column type information
-func (r *MongoDBResult) ColumnTypes() ([]domain.ColumnType, error) {
-	// For MongoDB, column types are dynamic and document-specific
-	// This is a simplified implementation
-	return []domain.ColumnType{}, nil
-}
-
-// RowsAffected returns the number of rows affected (not applicable for queries)
-func (r *MongoDBResult) RowsAffected() (int64, error) {
-	return 0, nil
-}
-
-// LastInsertID returns the last insert ID (not applicable for queries)
-func (r *MongoDBResult) LastInsertID() (int64, error) {
-	return 0, nil
-}
-
-// Err returns any error that occurred during iteration
-func (r *MongoDBResult) Err() error {
+	r.closed = true
+	r.current = nil
+	var err error
 	if r.cursor != nil {
-		return r.cursor.Err()
+		if cerr := r.cursor.Close(r.ctx); cerr != nil {
+			err = queryError(cerr, "failed to close cursor")
+		}
 	}
+	if r.cancel != nil {
+		r.cancel()
+	}
+	return err
+}
+
+// Scan copies the columns of the current document into dest, in select order
+// for projected queries and in document order otherwise.
+func (r *MongoDBResult) Scan(dest ...interface{}) error {
+	if r.current == nil {
+		return errNoCurrentDocument()
+	}
+	return scanColumns(r.current, r.columns, dest)
+}
+
+// ScanRow decodes the current document into dest (a pointer to a struct, map or bson.D).
+func (r *MongoDBResult) ScanRow(dest interface{}) error {
+	if r.current == nil {
+		return errNoCurrentDocument()
+	}
+	return decodeDocument(r.current, dest)
+}
+
+// Columns returns the projected fields, or the current document's field names
+// when the query returns whole documents.
+func (r *MongoDBResult) Columns() ([]string, error) {
+	if r.columns != nil {
+		return slices.Clone(r.columns), nil
+	}
+	if r.current == nil {
+		return nil, errNoCurrentDocument()
+	}
+	cols, err := documentColumns(r.current, nil)
+	if err != nil {
+		return nil, err
+	}
+	names := make([]string, len(cols))
+	for i, c := range cols {
+		names[i] = c.name
+	}
+	return names, nil
+}
+
+// ColumnTypes returns the columns with the BSON types of the current document's
+// values. Before Next, a projected result reports its columns with unknown types.
+func (r *MongoDBResult) ColumnTypes() ([]domain.ColumnType, error) {
+	if r.current == nil {
+		if r.columns == nil {
+			return nil, errNoCurrentDocument()
+		}
+		types := make([]domain.ColumnType, len(r.columns))
+		for i, name := range r.columns {
+			types[i] = domain.ColumnType{Name: name, Nullable: true}
+		}
+		return types, nil
+	}
+	cols, err := documentColumns(r.current, r.columns)
+	if err != nil {
+		return nil, err
+	}
+	types := make([]domain.ColumnType, len(cols))
+	for i, c := range cols {
+		typeName := bsonTypeNames[c.value.Type]
+		dataType, err := mapDatabaseType(typeName)
+		if err != nil {
+			dataType = domain.DataTypeUnknown
+		}
+		types[i] = domain.ColumnType{Name: c.name, DatabaseType: typeName, DataType: dataType, Nullable: true}
+	}
+	return types, nil
+}
+
+// RowsAffected is not applicable to query results.
+func (r *MongoDBResult) RowsAffected() (int64, error) {
+	return 0, domain.NewDataError("NOT_APPLICABLE", "rows affected not applicable for query results")
+}
+
+// LastInsertID is not applicable to query results.
+func (r *MongoDBResult) LastInsertID() (int64, error) {
+	return 0, domain.NewDataError("NOT_SUPPORTED", "last insert ID not supported for MongoDB query results")
+}
+
+// Err returns the error, if any, that ended iteration.
+func (r *MongoDBResult) Err() error {
 	return r.err
 }
 
-// MongoDBRow implements the domain.Row interface for MongoDB
+// MongoDBRow implements domain.Row for a single document.
 type MongoDBRow struct {
-	document bson.M
-	err      error
+	document bson.Raw
+	columns  []string
 }
 
-// Scan scans the document into the provided destinations
+// Scan copies the document's columns into dest (see MongoDBResult.Scan).
 func (r *MongoDBRow) Scan(dest ...interface{}) error {
 	if r.document == nil {
-		return domain.NewDataError("NO_DOCUMENT", "no document available")
+		return errNoCurrentDocument()
 	}
-
-	// Map document fields to destinations
-	if len(dest) == 1 {
-		// Single destination - try to decode entire document
-		destValue := reflect.ValueOf(dest[0])
-		if destValue.Kind() != reflect.Ptr {
-			return domain.NewDataError("INVALID_DESTINATION", "destination must be a pointer")
-		}
-
-		destElem := destValue.Elem()
-		if destElem.Kind() == reflect.Struct {
-			return r.scanToStruct(destElem)
-		} else {
-			// Single field - get first value
-			for _, value := range r.document {
-				return setFieldValue(destElem, value)
-			}
-		}
-	}
-
-	// Multiple destinations - map by field order
-	i := 0
-	for _, value := range r.document {
-		if i >= len(dest) {
-			break
-		}
-		destValue := reflect.ValueOf(dest[i])
-		if destValue.Kind() != reflect.Ptr {
-			return domain.NewDataError("INVALID_DESTINATION", "destination must be a pointer")
-		}
-		if err := setFieldValue(destValue.Elem(), value); err != nil {
-			return domain.NewDataError("FIELD_MAPPING_FAILED", err.Error()).WithCause(err)
-		}
-		i++
-	}
-
-	return nil
+	return scanColumns(r.document, r.columns, dest)
 }
 
-// ScanRow scans the document into a struct
+// ScanRow decodes the document into dest (a pointer to a struct, map or bson.D).
 func (r *MongoDBRow) ScanRow(dest interface{}) error {
 	if r.document == nil {
-		return domain.NewDataError("NO_DOCUMENT", "no document available")
+		return errNoCurrentDocument()
 	}
-
-	destValue := reflect.ValueOf(dest)
-	if destValue.Kind() != reflect.Ptr {
-		return domain.NewDataError("INVALID_DESTINATION", "destination must be a pointer")
-	}
-
-	destElem := destValue.Elem()
-	if destElem.Kind() != reflect.Struct {
-		return domain.NewDataError("INVALID_DESTINATION", "destination must be a pointer to struct")
-	}
-
-	return r.scanToStruct(destElem)
+	return decodeDocument(r.document, dest)
 }
 
-// Err returns any error that occurred
+// Err returns nil: QueryOne reports failures, including no rows, directly.
 func (r *MongoDBRow) Err() error {
-	return r.err
-}
-
-// scanToStruct scans the document into a struct using field names or bson tags
-func (r *MongoDBRow) scanToStruct(destValue reflect.Value) error {
-	destType := destValue.Type()
-
-	for i := 0; i < destType.NumField(); i++ {
-		field := destType.Field(i)
-		fieldValue := destValue.Field(i)
-
-		if !fieldValue.CanSet() {
-			continue
-		}
-
-		// Get field name from bson tag or field name
-		fieldName := field.Name
-		if bsonTag := field.Tag.Get("bson"); bsonTag != "" && bsonTag != "-" {
-			// Parse bson tag (handle "name,omitempty" format)
-			if commaIndex := len(bsonTag); commaIndex > 0 {
-				if idx := findComma(bsonTag); idx != -1 {
-					fieldName = bsonTag[:idx]
-				} else {
-					fieldName = bsonTag
-				}
-			}
-		}
-
-		// Get value from document
-		if value, exists := r.document[fieldName]; exists {
-			if err := setFieldValue(fieldValue, value); err != nil {
-				return domain.NewDataError("FIELD_MAPPING_FAILED",
-					fmt.Sprintf("failed to set field %s: %v", fieldName, err)).WithCause(err)
-			}
-		}
-	}
-
 	return nil
 }
 
-// setFieldValue sets a reflect.Value with the given interface{} value
-func setFieldValue(field reflect.Value, value interface{}) error {
-	if value == nil {
-		return nil
+func errNoCurrentDocument() error {
+	return domain.NewDataError("NO_CURRENT_ROW", "no current document: Next must be called and return true first")
+}
+
+type column struct {
+	name  string
+	value bson.RawValue
+}
+
+// documentColumns returns the projected fields of doc in select order, or all of
+// its elements in document order when fields is nil. A projected field that is
+// missing from the document reads as null.
+func documentColumns(doc bson.Raw, fields []string) ([]column, error) {
+	if fields != nil {
+		cols := make([]column, len(fields))
+		for i, f := range fields {
+			v, err := doc.LookupErr(strings.Split(f, ".")...)
+			if err != nil {
+				v = bson.RawValue{Type: bson.TypeNull}
+			}
+			cols[i] = column{name: f, value: v}
+		}
+		return cols, nil
 	}
-
-	valueReflect := reflect.ValueOf(value)
-	fieldType := field.Type()
-
-	// Handle type conversions
-	if valueReflect.Type().ConvertibleTo(fieldType) {
-		field.Set(valueReflect.Convert(fieldType))
-		return nil
+	elems, err := doc.Elements()
+	if err != nil {
+		return nil, domain.NewDataError("INVALID_DATA", "malformed document").WithCause(err)
 	}
-
-	// Handle special cases
-	switch fieldType.Kind() {
-	case reflect.String:
-		field.SetString(fmt.Sprintf("%v", value))
-	case reflect.Int, reflect.Int8, reflect.Int16, reflect.Int32, reflect.Int64:
-		if intVal, ok := convertToInt64(value); ok {
-			field.SetInt(intVal)
-		} else {
-			return fmt.Errorf("cannot convert %T to int", value)
-		}
-	case reflect.Uint, reflect.Uint8, reflect.Uint16, reflect.Uint32, reflect.Uint64:
-		if intVal, ok := convertToInt64(value); ok && intVal >= 0 {
-			field.SetUint(uint64(intVal))
-		} else {
-			return fmt.Errorf("cannot convert %T to uint", value)
-		}
-	case reflect.Float32, reflect.Float64:
-		if floatVal, ok := convertToFloat64(value); ok {
-			field.SetFloat(floatVal)
-		} else {
-			return fmt.Errorf("cannot convert %T to float", value)
-		}
-	case reflect.Bool:
-		if boolVal, ok := value.(bool); ok {
-			field.SetBool(boolVal)
-		} else {
-			return fmt.Errorf("cannot convert %T to bool", value)
-		}
-	case reflect.Slice:
-		if valueReflect.Kind() == reflect.Slice {
-			field.Set(valueReflect)
-		} else {
-			return fmt.Errorf("cannot convert %T to slice", value)
-		}
-	case reflect.Map:
-		if valueReflect.Kind() == reflect.Map {
-			field.Set(valueReflect)
-		} else {
-			return fmt.Errorf("cannot convert %T to map", value)
-		}
-	case reflect.Interface:
-		field.Set(valueReflect)
-	default:
-		return fmt.Errorf("unsupported field type: %v", fieldType.Kind())
+	cols := make([]column, len(elems))
+	for i, e := range elems {
+		cols[i] = column{name: e.Key(), value: e.Value()}
 	}
+	return cols, nil
+}
 
+func scanColumns(doc bson.Raw, fields []string, dest []interface{}) error {
+	cols, err := documentColumns(doc, fields)
+	if err != nil {
+		return err
+	}
+	if len(dest) != len(cols) {
+		return domain.NewDataError("INVALID_DESTINATION",
+			fmt.Sprintf("expected %d destination arguments in Scan, got %d", len(cols), len(dest)))
+	}
+	for i, d := range dest {
+		if err := decodeValue(cols[i].value, d); err != nil {
+			return domain.NewDataError("SCAN_FAILED", fmt.Sprintf("cannot scan field %q", cols[i].name)).WithCause(err)
+		}
+	}
 	return nil
 }
 
-// convertToInt64 converts various numeric types to int64
-func convertToInt64(value interface{}) (int64, bool) {
-	switch v := value.(type) {
-	case int:
-		return int64(v), true
-	case int8:
-		return int64(v), true
-	case int16:
-		return int64(v), true
-	case int32:
-		return int64(v), true
-	case int64:
-		return v, true
-	case uint:
-		return int64(v), true
-	case uint8:
-		return int64(v), true
-	case uint16:
-		return int64(v), true
-	case uint32:
-		return int64(v), true
-	case uint64:
-		if v <= 9223372036854775807 { // max int64
-			return int64(v), true
-		}
-	case float32:
-		return int64(v), true
-	case float64:
-		return int64(v), true
+// decodeValue decodes v into dest with the driver's rules, additionally
+// accepting an ObjectID for a *string (as its hex form).
+func decodeValue(v bson.RawValue, dest interface{}) error {
+	if s, ok := dest.(*string); ok && v.Type == bson.TypeObjectID {
+		*s = v.ObjectID().Hex()
+		return nil
 	}
-	return 0, false
+	return v.Unmarshal(dest)
 }
 
-// convertToFloat64 converts various numeric types to float64
-func convertToFloat64(value interface{}) (float64, bool) {
-	switch v := value.(type) {
-	case int:
-		return float64(v), true
-	case int8:
-		return float64(v), true
-	case int16:
-		return float64(v), true
-	case int32:
-		return float64(v), true
-	case int64:
-		return float64(v), true
-	case uint:
-		return float64(v), true
-	case uint8:
-		return float64(v), true
-	case uint16:
-		return float64(v), true
-	case uint32:
-		return float64(v), true
-	case uint64:
-		return float64(v), true
-	case float32:
-		return float64(v), true
-	case float64:
-		return v, true
+// decodeDocument decodes doc with the driver's struct mapping (bson tags, else
+// lowercased field names); ObjectIDs decode into strings as hex.
+func decodeDocument(doc bson.Raw, dest interface{}) error {
+	dec := bson.NewDecoder(bson.NewDocumentReader(bytes.NewReader(doc)))
+	dec.ObjectIDAsHexString()
+	if err := dec.Decode(dest); err != nil {
+		return domain.NewDataError("SCAN_FAILED", "cannot decode document").WithCause(err)
 	}
-	return 0, false
-}
-
-// findComma finds the first comma in a string
-func findComma(s string) int {
-	for i, r := range s {
-		if r == ',' {
-			return i
-		}
-	}
-	return -1
+	return nil
 }
